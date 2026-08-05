@@ -5,6 +5,8 @@ mod media;
 mod models;
 mod network;
 mod payload;
+mod plugin;
+mod plugin_ipc;
 mod preview;
 mod settings;
 
@@ -613,7 +615,9 @@ async fn update_settings(
     patch: SettingsPatch,
 ) -> Result<AppSnapshot, String> {
     let behavior = lock(&state.settings)?.patch(patch)?.behavior;
-    host::sync_autostart(behavior.auto_start_with_windows, behavior.start_minimized)?;
+    if !plugin::is_plugin_mode() {
+        host::sync_autostart(behavior.auto_start_with_windows, behavior.start_minimized)?;
+    }
     state.sync_preview()?;
     let snapshot = state.emit_snapshot(&app)?;
     queue_live_apply(&app)?;
@@ -717,8 +721,7 @@ fn open_data_directory(state: State<'_, StudioState>) -> Result<(), String> {
     host::open_data_directory(&state.data_directory)
 }
 
-#[tauri::command]
-fn show_window(app: AppHandle) -> Result<(), String> {
+pub(crate) fn open_main_window(app: &AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "找不到主窗口。".to_string())?;
@@ -727,15 +730,23 @@ fn show_window(app: AppHandle) -> Result<(), String> {
     window.set_focus().map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn show_window(app: AppHandle) -> Result<(), String> {
+    open_main_window(&app)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            let _ = show_window(app.clone());
+            if !plugin::is_plugin_mode() {
+                let _ = open_main_window(&app);
+            }
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            let plugin_mode = plugin::is_plugin_mode();
             let state = StudioState::load()
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
             if let Ok(payload) = state.active_payload() {
@@ -755,24 +766,31 @@ pub fn run() {
             let settings = lock(&state.settings)
                 .map_err(std::io::Error::other)?
                 .value();
-            host::sync_autostart(
-                settings.behavior.auto_start_with_windows,
-                settings.behavior.start_minimized,
-            )
-            .map_err(std::io::Error::other)?;
-            let start_hidden = settings.behavior.start_minimized
+            if !plugin_mode {
+                host::sync_autostart(
+                    settings.behavior.auto_start_with_windows,
+                    settings.behavior.start_minimized,
+                )
+                .map_err(std::io::Error::other)?;
+            }
+            let start_hidden = plugin_mode
+                || settings.behavior.start_minimized
                 || std::env::args().any(|argument| argument == "--hidden");
             app.manage(state);
-            let tray = host::setup_tray(app.handle()).map_err(std::io::Error::other)?;
-            let managed = app.state::<StudioState>();
-            *lock(&managed.tray).map_err(std::io::Error::other)? = Some(tray);
-            if let Ok(tray) = lock(&managed.tray) {
-                if let Some(tray) = tray.as_ref() {
-                    host::update_tray(app.handle(), tray);
-                }
+            if plugin_mode {
+                plugin_ipc::start(app.handle().clone());
+            } else {
+                let tray = host::setup_tray(app.handle()).map_err(std::io::Error::other)?;
+                let managed = app.state::<StudioState>();
+                *lock(&managed.tray).map_err(std::io::Error::other)? = Some(tray);
+                if let Ok(tray) = lock(&managed.tray) {
+                    if let Some(tray) = tray.as_ref() {
+                        host::update_tray(app.handle(), tray);
+                    }
+                };
             }
             if !start_hidden {
-                show_window(app.handle().clone()).map_err(std::io::Error::other)?;
+                open_main_window(app.handle()).map_err(std::io::Error::other)?;
             }
             start_slideshow_scheduler(app.handle().clone());
             Ok(())

@@ -1,5 +1,12 @@
 # Notion Background Studio
 
+[![org](https://img.shields.io/badge/org-background--studio-0ea5e9)](https://github.com/background-studio)
+[![release](https://img.shields.io/github/v/release/background-studio/notion_desktop_background)](https://github.com/background-studio/notion_desktop_background/releases)
+
+属于 [Background Studio](https://github.com/background-studio) 组织。可独立安装，也可作为
+[Background Studio 壳](https://github.com/background-studio/background-studio) 的插件
+（`--plugin` + `*-plugin.zip`，见 [docs/plugin-protocol.md](./docs/plugin-protocol.md)）。
+
 一个面向 Windows 官方 Notion 桌面应用的独立背景管理器。它通过本机回环
 Chromium DevTools Protocol 动态加载背景，不修改 `app.asar`、应用签名、
 登录状态或页面数据。
@@ -56,12 +63,13 @@ NSIS 产物位于 `src-tauri/target/release/bundle/nsis/`。
 完整检查、构建 NSIS 安装包，并创建正式 GitHub Release：
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 工作流会核对 `package.json`、`src-tauri/Cargo.toml`、`tauri.conf.json` 和标签版本，
-任一不一致都会停止发布。
+任一不一致都会停止发布。Release 同时上传 NSIS 与
+`NotionBackgroundStudio-<version>-plugin.zip`。
 
 维护 Notion 页面样式、CDP 注入或媒体流程前，请先阅读项目 Skill：
 [`notion-background-development`](./.cursor/skills/notion-background-development/SKILL.md)。
@@ -75,4 +83,4 @@ git push origin v0.1.0
 
 ## 版本
 
-当前版本：`0.1.0`。
+当前版本：`0.2.0`。

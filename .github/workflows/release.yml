@@ -68,3 +68,22 @@ jobs:
           generateReleaseNotes: true
           releaseDraft: false
           prerelease: false
+
+      - name: Publish plugin.zip for Background Studio host
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $exe = Get-ChildItem "src-tauri/target/release/*.exe" |
+            Where-Object { $_.Name -notmatch '(?i)(uninstall|nsis)' } |
+            Select-Object -First 1
+          if (-not $exe) { throw "找不到 release 可执行文件。" }
+          $stage = Join-Path $env:RUNNER_TEMP "notion-plugin"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item $exe.FullName (Join-Path $stage "Notion Background Studio.exe")
+          $zipName = "NotionBackgroundStudio-$version-plugin.zip"
+          $zipPath = Join-Path $env:RUNNER_TEMP $zipName
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zipPath
+          gh release upload "${{ github.ref_name }}" $zipPath --clobber
