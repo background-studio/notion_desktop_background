@@ -16,6 +16,7 @@ describe("renderer payload", () => {
     expect(payload).toContain(".notion-cursor-listener");
     expect(payload).toContain("main.notion-frame");
     expect(payload).toContain(".notion-sidebar");
+    expect(payload).toContain("--c-bacEle");
     expect(payload).toContain(".notion-topbar");
     expect(payload).toContain("syncFullWindowMedia");
     expect(payload).toContain("data-cbg-cover");

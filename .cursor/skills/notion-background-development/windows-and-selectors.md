@@ -24,6 +24,9 @@ Notion class 名和 StyleX hash 可能随版本变化。这里记录的是稳定
 - 稳定入口：`.notion-sidebar`、`.notion-sidebar-container`、`nav.notion-sidebar-container`
 - 透明度：`--cbg-sidebar-opacity`（雾度 `* 28%`）
 - 内部不要再叠一层侧栏同色底。
+- **收起后悬停弹出**：`.notion-sidebar` 内绝对定位底板子层用
+  `background: var(--c-bacEle)`（常见实色 `#202020`）。只透明外层不够，
+  必须在侧栏上下文压掉 `--c-bacEle`，并覆盖带该变量的子层背景。
 - 底部「新对话」等实色钮：StyleX `background: var(--c-bacPri)`；
   标记 `data-cbg-solid-chrome="1"`，并压掉 `--c-bacPri` / `--c-bacInt`。
 

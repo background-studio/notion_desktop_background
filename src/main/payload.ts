@@ -87,6 +87,8 @@ html.notion-background-active .notion-sidebar-container,
 html.notion-background-active .notion-sidebar-switcher,
 html.notion-background-active nav.notion-sidebar-container,
 html.notion-background-active .notion-print-ignore {
+  /* 收起悬停弹出时，底板子层用 --c-bacEle（实色 #202020），需一并压成雾 */
+  --c-bacEle: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 28%), transparent) !important;
   background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 28%), transparent) !important;
   background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 28%), transparent) !important;
   backdrop-filter: none !important;
@@ -96,6 +98,12 @@ html.notion-background-active .notion-sidebar *,
 html.notion-background-active .notion-sidebar-container * {
   backdrop-filter: none !important;
   box-shadow: none !important;
+}
+/* 侧栏绝对定位底板：inline background: var(--c-bacEle) */
+html.notion-background-active .notion-sidebar [style*="--c-bacEle"],
+html.notion-background-active .notion-sidebar [style*="var(--c-bacEle)"] {
+  background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 28%), transparent) !important;
+  background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-sidebar-opacity) * 28%), transparent) !important;
 }
 
 /* 带「共享」的页面顶栏 + 主画布外框 */
