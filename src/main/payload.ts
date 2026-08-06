@@ -257,6 +257,11 @@ html.notion-background-tab-chrome .hide-scrollbar * {
   box-shadow: none !important;
   border-color: transparent !important;
 }
+/* Notion 在标签边缘用内联 linear-gradient 画暗色过渡；它不是 box-shadow。 */
+html.notion-background-tab-chrome [style*="linear-gradient"][style*="--gradient-direction"] {
+  background: transparent !important;
+  background-image: none !important;
+}
 
 /* 弹出菜单、对话框按菜单透明度打底。 */
 html.notion-background-active .notion-overlay-container [role="dialog"],
@@ -544,7 +549,10 @@ export function buildRendererPayload(input: PayloadInput) {
           media.playbackRate = Number(config.display.videoPlaybackRate) || 1;
         }
         media.src = blobUrl;
-        media.addEventListener("error", () => cleanup());
+        // 媒体加载失败不要拆掉整页注入；否则 Tab Bar 会只剩透明底+系统黑底。
+        media.addEventListener("error", () => {
+          try { console.warn("[notion-background] media load failed", media.currentSrc || media.src); } catch {}
+        });
         const tile = document.createElement("div");
         tile.id = "notion-background-tile";
         const overlay = document.createElement("div");
@@ -554,9 +562,14 @@ export function buildRendererPayload(input: PayloadInput) {
         if (config.mediaKind === "video") media.play().catch(() => undefined);
       }
       if (layer) {
+        const mediaNode = document.getElementById("notion-background-media");
+        if (mediaNode && mediaNode.getAttribute("src") !== blobUrl) {
+          mediaNode.setAttribute("src", blobUrl);
+          if (config.mediaKind === "video") mediaNode.play?.().catch(() => undefined);
+        }
         syncFullWindowMedia(
           layer,
-          document.getElementById("notion-background-media"),
+          mediaNode,
           document.getElementById("notion-background-tile"),
         );
       }

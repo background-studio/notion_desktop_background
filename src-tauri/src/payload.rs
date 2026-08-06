@@ -43,6 +43,8 @@ fn digest(parts: &[&[u8]]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// 媒体以内嵌 data URL 进入渲染页，避免 Notion 拦截本机回环 HTTP 请求。
+/// Injector 对大 payload 只执行一次实时 evaluate，不会再把同一份媒体重复注册为 early script。
 pub fn build_active_payload(
     media: &MediaItem,
     media_path: &Path,

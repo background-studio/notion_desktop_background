@@ -5,13 +5,17 @@ Notion class 名和 StyleX hash 可能随版本变化。这里记录的是稳定
 
 ## 全局窗口骨架
 
-### Electron 顶部标签栏
+### Electron 顶部标签栏（含 Windows 最小化/最大化/关闭那一行）
 
 - 独立 page：`file:///.../app.asar/.webpack/renderer/tabs/index.html`
 - 典型高度约 `36px`；主内容 `innerHeight` ≈ `outerHeight - 36`。
 - 根 class：`notion-background-tab-chrome`
 - 处理：清 `.root` / `.hide-scrollbar` 及标签芯片实色底。
+- 标签边缘的暗条是内联 `linear-gradient(var(--gradient-direction, ...))`，不是
+  `box-shadow`；需在 Tab Bar 范围内同时清掉 `background-image`。
 - 背景媒体：高度用 `outerHeight`，`top: 0`，与主页共用同一张图。
+- Notion 渲染页会拦截本机回环 HTTP 媒体请求，因此媒体仍需内嵌为 data URL。
+  大 payload 只做一次实时 `evaluate`；early script 仅注册轻量透明样式，禁止重复发送整图。
 
 ### 主内容页
 
