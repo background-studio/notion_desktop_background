@@ -23,6 +23,9 @@ describe("renderer payload", () => {
     expect(payload).toContain("markNativeCovers");
     expect(payload).toContain(".chat_sidebar");
     expect(payload).toContain("--c-bacSec");
+    expect(payload).toContain('.notion-peek-renderer > div[style*="var(--c-bacEle)"]');
+    expect(payload).toContain(".peek-top-hover-area");
+    expect(payload).toContain(".notion-peek-renderer .notion-scroller");
     expect(payload).toContain(".notion-record-icon img");
     expect(payload).toContain("isTabChrome");
     expect(payload).toContain("notion-background-home");
@@ -31,6 +34,10 @@ describe("renderer payload", () => {
     expect(payload).toContain("notion-dark-theme");
     expect(payload).toContain("__NOTION_BACKGROUND_STUDIO__");
     expect(payload).toContain("requestAnimationFrame");
+    expect(payload).toContain('layer.style.setProperty("opacity", "calc(var(--cbg-opacity) * var(--cbg-route-intensity))")');
+    expect(payload.indexOf('setClass("notion-background-home", !blank)')).toBeLessThan(
+      payload.indexOf('layer.style.setProperty("opacity", "calc(var(--cbg-opacity) * var(--cbg-route-intensity))")'),
+    );
     expect(payload).not.toContain("}, 200)");
     expect(payload).not.toContain("backdrop-filter: blur");
     expect(payload).not.toContain("body > #root");

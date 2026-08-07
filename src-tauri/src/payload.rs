@@ -4,7 +4,10 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::models::{DisplaySettings, MediaItem, MediaKind};
+use crate::{
+    injector::EARLY_TRANSPARENCY_SCRIPT,
+    models::{DisplaySettings, MediaItem, MediaKind},
+};
 
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/payload_assets.rs"));
@@ -74,6 +77,7 @@ pub fn build_active_payload(
         revision.as_bytes(),
         generated::BACKGROUND_CSS.as_bytes(),
         generated::REVIEW_SHADOW_CSS.as_bytes(),
+        EARLY_TRANSPARENCY_SCRIPT.as_bytes(),
     ]);
     let serialized = serde_json::to_string(&PayloadConfig {
         media_url: &media_url,
@@ -94,7 +98,10 @@ pub fn build_active_payload(
         .replace("${css}", &css)
         .replace("${reviewShadowCss}", &review_css)
         .replace("${reviewShadowStyleId}", &review_style_id);
-    Ok(ActivePayload { script, revision })
+    Ok(ActivePayload {
+        script,
+        revision: payload_revision,
+    })
 }
 
 #[cfg(test)]
@@ -127,6 +134,10 @@ mod tests {
         assert!(payload.script.contains("notion-background-layer"));
         assert!(payload.script.contains("diffs-container"));
         assert!(payload.script.contains("data:image/png;base64,"));
+        let revision_literal = format!(r#""revision":"{}""#, payload.revision);
+        assert!(payload.script.contains(&revision_literal));
+        assert!(payload.script.contains("window[STATE] = { revision: config.revision"));
+        assert!(payload.script.contains("style.dataset.cbgRevision = config.revision"));
         assert_eq!(payload.revision.len(), 64);
         let _ = fs::remove_dir_all(root);
     }

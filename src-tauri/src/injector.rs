@@ -15,6 +15,7 @@ use tungstenite::{connect, stream::MaybeTlsStream, Message, WebSocket};
 use url::Url;
 
 const REMOVE_RENDERER_PAYLOAD: &str = r#"(() => {
+  document.getElementById("notion-background-early-transparency")?.remove();
   const state = window.__NOTION_BACKGROUND_STUDIO__;
   if (state?.cleanup) return state.cleanup();
   document.getElementById("notion-background-layer")?.remove();
@@ -321,6 +322,11 @@ impl CdpSession {
             .cloned()
             .unwrap_or(Value::Null))
     }
+
+    fn document_has_revision(&self, revision: &str) -> Result<bool, String> {
+        self.evaluate(&document_revision_probe(revision))
+            .map(|value| value.as_bool().unwrap_or(false))
+    }
 }
 
 impl Drop for CdpSession {
@@ -366,6 +372,27 @@ fn early_payload_for(payload: &str, revision: &str) -> String {
     )
 }
 
+fn document_revision_probe(revision: &str) -> String {
+    let safe_revision = serde_json::to_string(revision).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        r#"(() => {{
+  const expected = {safe_revision};
+  const state = window.__NOTION_BACKGROUND_STUDIO__;
+  const style = document.getElementById("notion-background-style");
+  return state?.revision === expected && style?.dataset?.cbgRevision === expected;
+}})()"#
+    )
+}
+
+fn should_apply_payload(
+    managed_revision: Option<&str>,
+    expected_revision: &str,
+    document_matches: bool,
+    force: bool,
+) -> bool {
+    force || managed_revision != Some(expected_revision) || !document_matches
+}
+
 fn remove_from_session(managed: &mut ManagedSession) {
     if let Some(identifier) = managed.early_script_id.take() {
         let _ = managed.session.send(
@@ -380,11 +407,29 @@ fn remove_from_session(managed: &mut ManagedSession) {
 /// 超过该体积时不再把完整媒体脚本注册为 early script（会再复制一份经 CDP 发送）。
 const LARGE_PAYLOAD_EARLY_BYTES: usize = 400 * 1024;
 
-const EARLY_TRANSPARENCY_SCRIPT: &str = r#"(() => {
+pub(crate) const EARLY_TRANSPARENCY_SCRIPT: &str = r#"(() => {
   try {
     const style = document.createElement("style");
     style.id = "notion-background-early-transparency";
-    style.textContent = "html,body,.notion-app-inner,.notion-cursor-listener,main.notion-frame,header,.notion-topbar,.notion-sidebar,.notion-sidebar-container,.root,.notion-dark-theme{background:transparent!important;background-color:transparent!important}";
+    const isTabChrome = location.protocol === "file:" &&
+      location.href.toLowerCase().includes("/tabs/index.html");
+    const tabChromeCss = isTabChrome ? `
+.root, .root.notion-dark-theme, .root.notion-light-theme, .hide-scrollbar {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+.root *, .hide-scrollbar * {
+  background-color: transparent !important;
+  box-shadow: none !important;
+  border-color: transparent !important;
+}
+[style*="linear-gradient"][style*="--gradient-direction"] {
+  background: transparent !important;
+  background-image: none !important;
+}
+` : "";
+    style.textContent = "html,body,.notion-app-inner,.notion-cursor-listener,main.notion-frame,header,.notion-topbar,.notion-sidebar,.notion-sidebar-container,.root,.notion-dark-theme{background:transparent!important;background-color:transparent!important}" +
+      tabChromeCss;
     (document.documentElement || document).appendChild(style);
   } catch {}
 })()"#;
@@ -477,7 +522,21 @@ fn sync_inner(inner: &Arc<Mutex<InjectorInner>>, target_count: &AtomicUsize, for
         let revision = inner.revision.clone();
         if let (Some(payload), Some(revision)) = (payload, revision) {
             for managed in inner.sessions.values_mut() {
-                if force {
+                let document_matches = !force
+                    && managed.revision.as_deref() == Some(revision.as_str())
+                    && managed
+                        .session
+                        .document_has_revision(&revision)
+                        .unwrap_or(false);
+                if !should_apply_payload(
+                    managed.revision.as_deref(),
+                    &revision,
+                    document_matches,
+                    force,
+                ) {
+                    continue;
+                }
+                if managed.revision.is_some() {
                     managed.revision = None;
                 }
                 if let Err(error) = apply_to_session(managed, &payload, &revision) {
@@ -648,6 +707,72 @@ mod tests {
         assert!(payload.contains("revision-1"));
         assert!(payload.contains("MutationObserver"));
         assert!(REMOVE_RENDERER_PAYLOAD.contains("cleanup"));
+    }
+
+    #[test]
+    fn large_payload_early_script_cleans_tab_chrome() {
+        assert!(EARLY_TRANSPARENCY_SCRIPT.contains("/tabs/index.html"));
+        assert!(EARLY_TRANSPARENCY_SCRIPT.contains(".root *"));
+        assert!(EARLY_TRANSPARENCY_SCRIPT.contains("box-shadow: none !important"));
+        assert!(EARLY_TRANSPARENCY_SCRIPT.contains("[style*="));
+        assert!(EARLY_TRANSPARENCY_SCRIPT.contains("background-image: none !important"));
+    }
+
+    #[test]
+    fn early_transparency_cleanup_runs_before_state_cleanup() {
+        let early_style = REMOVE_RENDERER_PAYLOAD
+            .find("notion-background-early-transparency")
+            .expect("early style cleanup is present");
+        let state_lookup = REMOVE_RENDERER_PAYLOAD
+            .find("const state =")
+            .expect("state cleanup is present");
+        assert!(early_style < state_lookup);
+    }
+
+    #[test]
+    fn document_revision_probe_checks_state_and_style() {
+        let probe = document_revision_probe("revision-1");
+        assert!(probe.contains("window.__NOTION_BACKGROUND_STUDIO__"));
+        assert!(probe.contains("notion-background-style"));
+        assert!(probe.contains("cbgRevision"));
+        assert!(probe.contains("revision-1"));
+    }
+
+    #[test]
+    fn matching_document_skips_apply_and_mismatch_reapplies_once() {
+        assert!(!should_apply_payload(
+            Some("revision-1"),
+            "revision-1",
+            true,
+            false
+        ));
+        assert!(should_apply_payload(
+            Some("revision-1"),
+            "revision-1",
+            false,
+            false
+        ));
+
+        let mut managed_revision = Some("revision-1".to_string());
+        let mut send_count = 0;
+        for document_matches in [false, true] {
+            if should_apply_payload(
+                managed_revision.as_deref(),
+                "revision-1",
+                document_matches,
+                false,
+            ) {
+                send_count += 1;
+                managed_revision = Some("revision-1".to_string());
+            }
+        }
+        assert_eq!(send_count, 1);
+        assert!(!should_apply_payload(
+            managed_revision.as_deref(),
+            "revision-1",
+            true,
+            false
+        ));
     }
 
     #[test]

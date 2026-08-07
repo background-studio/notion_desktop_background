@@ -127,6 +127,42 @@ html.notion-background-active main.notion-frame .content-editable-void-no-select
   background-color: transparent !important;
 }
 
+/* 右侧文章预览：稳定入口是 .notion-peek-renderer；其直接子壳层以内联
+ * background: var(--c-bacEle) + --c-shaOutMd 盖住整块页面，必须只在该区域压掉。 */
+html.notion-background-active .notion-peek-renderer > div[style*="var(--c-bacEle)"],
+html.notion-background-active .notion-peek-renderer > div[style*="var(--c-bacEle)"] > .peek-top-hover-area {
+  --c-bacPri: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 28%), transparent) !important;
+  --c-bacSec: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 28%), transparent) !important;
+  --c-bacEle: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 28%), transparent) !important;
+  --c-bacInt: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 28%), transparent) !important;
+  background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 28%), transparent) !important;
+  background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 28%), transparent) !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+}
+html.notion-background-active .notion-peek-renderer .notion-page-content,
+html.notion-background-active .notion-peek-renderer .notion-scroller,
+html.notion-background-active .notion-peek-renderer .layout-content,
+html.notion-background-active .notion-peek-renderer [class*="notion-page-block"],
+html.notion-background-active .notion-peek-renderer .whenContentEditable,
+html.notion-background-active .notion-peek-renderer .content-editable-void-no-select {
+  background: transparent !important;
+  background-color: transparent !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+}
+html.notion-background-active .notion-peek-renderer [style*="--c-bluBacSec"] {
+  background: color-mix(in srgb, var(--c-bluBacSec) calc(var(--cbg-surface-opacity) * 55%), transparent) !important;
+  background-color: color-mix(in srgb, var(--c-bluBacSec) calc(var(--cbg-surface-opacity) * 55%), transparent) !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+}
+html.notion-background-active .notion-peek-renderer img[data-cbg-cover="1"],
+html.notion-background-active .notion-peek-renderer .notion-record-icon img {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
 /*
  * 页面封面：允许显示，按顶栏/画布滑杆做半透明。
  * 绝不能 visibility:hidden / opacity:0 —— Notion 懒加载会永久停在 1x1 占位图，
@@ -382,7 +418,7 @@ export function buildRendererPayload(input: PayloadInput) {
     };
 
     const markNativeCovers = () => {
-      document.querySelectorAll("main.notion-frame img").forEach((img) => {
+      document.querySelectorAll("main.notion-frame img, .notion-peek-renderer img").forEach((img) => {
         if (img.id === "notion-background-media") return;
         if (img.classList?.contains("notion-emoji")) return;
         if (img.closest?.(".notion-record-icon")) return;
@@ -604,6 +640,12 @@ export function buildRendererPayload(input: PayloadInput) {
       const blank = /\/blank(?:\?|$)/.test(location.pathname + location.search);
       setClass("notion-background-home", !blank);
       setClass("notion-background-task", blank);
+      // Re-apply the resolved opacity inline after route variables/classes settle.
+      // Electron can leave the stylesheet declaration at its initial value when
+      // the large payload creates the layer before the Notion document finishes mounting.
+      if (layer) {
+        layer.style.setProperty("opacity", "calc(var(--cbg-opacity) * var(--cbg-route-intensity))");
+      }
       return true;
     };
 
