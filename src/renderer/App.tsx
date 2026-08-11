@@ -38,7 +38,7 @@ import {
   SettingsPatch,
 } from "../shared/contracts";
 import { bridge } from "./bridge";
-import brandIcon from "./brand-icon.png";
+import brandIcon from "../../assets/icon.png";
 
 type InspectorTab = "display" | "pages" | "slideshow" | "settings";
 type PreviewRoute = "home" | "task";

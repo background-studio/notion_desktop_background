@@ -17,6 +17,7 @@ use wait_timeout::ChildExt;
 use crate::{
     injector::{read_browser_identity, InjectorEngine},
     models::RuntimeStatus,
+    payload::ActivePayload,
     settings::write_json_transaction,
 };
 
@@ -353,11 +354,7 @@ impl NotionController {
         true
     }
 
-    pub fn reconnect_saved(
-        &mut self,
-        payload: String,
-        revision: String,
-    ) -> Result<bool, String> {
+    pub fn reconnect_saved(&mut self, payload: ActivePayload) -> Result<bool, String> {
         if self.state.is_none() {
             return Ok(false);
         }
@@ -371,7 +368,7 @@ impl NotionController {
             .engine
             .as_mut()
             .expect("engine set after saved session validation")
-            .start(payload, revision);
+            .start(payload);
         match result {
             Ok(()) => {
                 self.status.phase = "active".to_string();
@@ -392,8 +389,7 @@ impl NotionController {
 
     pub fn apply(
         &mut self,
-        payload: String,
-        revision: String,
+        payload: ActivePayload,
         restart_existing: bool,
     ) -> Result<RuntimeStatus, String> {
         self.status.phase = "starting".to_string();
@@ -402,7 +398,7 @@ impl NotionController {
         let result: Result<RuntimeStatus, String> = (|| {
             let install = discover_notion()?;
             if let Some(engine) = &self.engine {
-                engine.update(payload, revision)?;
+                engine.update(payload)?;
                 self.status.phase = "active".to_string();
                 self.status.message = "背景已实时应用".to_string();
                 self.status.notion_version = Some(install.version);
@@ -412,7 +408,7 @@ impl NotionController {
                 self.engine
                     .as_mut()
                     .expect("engine set after attach")
-                    .start(payload, revision)?;
+                    .start(payload)?;
                 self.status.phase = "active".to_string();
                 self.status.message = "已重新连接背景会话".to_string();
                 self.status.notion_version = Some(install.version);
@@ -431,7 +427,7 @@ impl NotionController {
                     created_at: Utc::now().to_rfc3339(),
                 }))?;
                 let mut engine = InjectorEngine::new(port, browser_id);
-                engine.start(payload.clone(), revision.clone())?;
+                engine.start(payload.clone())?;
                 self.engine = Some(engine);
                 self.status.phase = "active".to_string();
                 self.status.message = "已重新连接背景会话".to_string();
@@ -472,7 +468,7 @@ impl NotionController {
                 created_at: Utc::now().to_rfc3339(),
             }))?;
             let mut engine = InjectorEngine::new(port, browser_id);
-            engine.start(payload, revision)?;
+            engine.start(payload)?;
             self.engine = Some(engine);
             self.status.phase = "active".to_string();
             self.status.message = "背景已应用".to_string();
