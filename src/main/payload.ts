@@ -21,7 +21,7 @@ html.notion-background-active .notion-light-theme.root {
   pointer-events: none;
   opacity: calc(var(--cbg-opacity) * var(--cbg-route-intensity));
   background-color: transparent;
-  transition: opacity 220ms ease;
+  transition: none !important;
 }
 
 #notion-background-media,
@@ -341,7 +341,7 @@ export function buildRendererPayload(input: PayloadInput) {
   const css = JSON.stringify(BACKGROUND_CSS);
   const reviewShadowCss = JSON.stringify(REVIEW_SHADOW_CSS);
   const reviewShadowStyleId = JSON.stringify(REVIEW_SHADOW_STYLE_ID);
-  return String.raw`((config, cssText, reviewShadowCssText, reviewShadowStyleId) => {
+  return String.raw`(async (config, cssText, reviewShadowCssText, reviewShadowStyleId) => {
     const STATE = "__NOTION_BACKGROUND_STUDIO__";
     const STYLE_ID = "notion-background-style";
     const LAYER_ID = "notion-background-layer";
@@ -361,14 +361,6 @@ export function buildRendererPayload(input: PayloadInput) {
     ];
 
     const previous = window[STATE];
-    if (previous?.cleanup) {
-      previous.cleanup();
-    } else {
-      if (previous?.observer) previous.observer.disconnect();
-      if (previous?.timer) clearInterval(previous.timer);
-      previous?.layer?.remove();
-      if (previous?.blobUrl) URL.revokeObjectURL(previous.blobUrl);
-    }
     let scheduled = null;
     let shadowPatch = null;
 
@@ -381,6 +373,28 @@ export function buildRendererPayload(input: PayloadInput) {
       const mime = /^data:([^;,]+)/.exec(config.mediaUrl)?.[1] || "application/octet-stream";
       return URL.createObjectURL(new Blob([bytes], { type: mime }));
     })();
+
+    // Decode before touching the visible layer. Keeping the old background alive until
+    // this succeeds makes repeated slideshow updates an atomic visual replacement.
+    let preparedMedia = null;
+    if (config.mediaKind === "image") {
+      preparedMedia = document.createElement("img");
+      preparedMedia.src = blobUrl;
+      try {
+        await preparedMedia.decode();
+      } catch (error) {
+        if (!preparedMedia.complete || preparedMedia.naturalWidth < 1) throw error;
+      }
+    }
+
+    if (previous?.cleanup) {
+      previous.cleanup();
+    } else {
+      if (previous?.observer) previous.observer.disconnect();
+      if (previous?.timer) clearInterval(previous.timer);
+      previous?.layer?.remove();
+      if (previous?.blobUrl) URL.revokeObjectURL(previous.blobUrl);
+    }
 
     const installReviewShadowStyle = (host, shadow = host?.shadowRoot) => {
       if (!shadow) return false;
@@ -573,7 +587,7 @@ export function buildRendererPayload(input: PayloadInput) {
       if (!layer && document.body) {
         layer = document.createElement("div");
         layer.id = LAYER_ID;
-        const media = document.createElement(config.mediaKind === "video" ? "video" : "img");
+        const media = preparedMedia || document.createElement(config.mediaKind === "video" ? "video" : "img");
         media.id = "notion-background-media";
         media.setAttribute("aria-hidden", "true");
         if (config.mediaKind === "video") {
@@ -584,7 +598,7 @@ export function buildRendererPayload(input: PayloadInput) {
           media.playsInline = true;
           media.playbackRate = Number(config.display.videoPlaybackRate) || 1;
         }
-        media.src = blobUrl;
+        if (!media.getAttribute("src")) media.src = blobUrl;
         // 媒体加载失败不要拆掉整页注入；否则 Tab Bar 会只剩透明底+系统黑底。
         media.addEventListener("error", () => {
           try { console.warn("[notion-background] media load failed", media.currentSrc || media.src); } catch {}
@@ -594,6 +608,10 @@ export function buildRendererPayload(input: PayloadInput) {
         const overlay = document.createElement("div");
         overlay.id = "notion-background-overlay";
         layer.append(media, tile, overlay);
+        const initialBlank = /\/blank(?:\?|$)/.test(location.pathname + location.search);
+        const initialEnabled = initialBlank ? config.display.enabledOnTasks : config.display.enabledOnHome;
+        const initialIntensity = initialBlank ? config.display.taskIntensity : config.display.homeIntensity;
+        layer.style.opacity = String(Number(config.display.opacity) * Number(initialIntensity) * (initialEnabled ? 1 : 0));
         document.body.prepend(layer);
         if (config.mediaKind === "video") media.play().catch(() => undefined);
       }

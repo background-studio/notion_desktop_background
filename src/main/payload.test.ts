@@ -34,6 +34,12 @@ describe("renderer payload", () => {
     expect(payload).toContain("notion-dark-theme");
     expect(payload).toContain("__NOTION_BACKGROUND_STUDIO__");
     expect(payload).toContain("requestAnimationFrame");
+    expect(payload).toContain("await preparedMedia.decode()");
+    expect(payload).toContain("Decode before touching the visible layer");
+    expect(payload.indexOf("await preparedMedia.decode()")).toBeLessThan(payload.indexOf("previous.cleanup()"));
+    expect(payload.indexOf("layer.style.opacity = String")).toBeLessThan(payload.indexOf("document.body.prepend(layer)"));
+    expect(payload).toContain("transition: none !important");
+    expect(payload).not.toContain("transition: opacity");
     expect(payload).toContain('layer.style.setProperty("opacity", "calc(var(--cbg-opacity) * var(--cbg-route-intensity))")');
     expect(payload.indexOf('setClass("notion-background-home", !blank)')).toBeLessThan(
       payload.indexOf('layer.style.setProperty("opacity", "calc(var(--cbg-opacity) * var(--cbg-route-intensity))")'),
