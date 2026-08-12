@@ -687,7 +687,7 @@ export function earlyPayloadFor(payload: string, revision: string) {
   return String.raw`(() => {
     const revision = ${safeRevision};
     const run = () => {
-      if (!document.documentElement) return false;
+      if (document.documentElement?.localName !== "html") return false;
       try { ${payload}; return true; } catch { return false; }
     };
     if (!run()) {

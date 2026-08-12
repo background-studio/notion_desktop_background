@@ -61,5 +61,6 @@ describe("renderer payload", () => {
     const early = earlyPayloadFor("window.test = true", "revision-1");
     expect(early).toContain("revision-1");
     expect(early).toContain("MutationObserver");
+    expect(early).toContain('document.documentElement?.localName !== "html"');
   });
 });

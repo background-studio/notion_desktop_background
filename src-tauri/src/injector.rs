@@ -405,7 +405,7 @@ fn early_payload_for(payload: &str, revision: &str) -> String {
         r#"(() => {{
   const revision = {safe_revision};
   const run = () => {{
-    if (!document.documentElement) return false;
+    if (document.documentElement?.localName !== "html") return false;
     try {{ {payload}; return true; }} catch {{ return false; }}
   }};
   if (!run()) {{
@@ -454,11 +454,14 @@ fn remove_from_session(managed: &mut ManagedSession) {
 
 pub(crate) const EARLY_TRANSPARENCY_SCRIPT: &str = r#"(() => {
   try {
-    const style = document.createElement("style");
-    style.id = "notion-background-early-transparency";
-    const isTabChrome = location.protocol === "file:" &&
-      location.href.toLowerCase().includes("/tabs/index.html");
-    const tabChromeCss = isTabChrome ? `
+    const install = () => {
+      const root = document.documentElement;
+      if (!root || root.localName !== "html") return false;
+      const style = document.createElement("style");
+      style.id = "notion-background-early-transparency";
+      const isTabChrome = location.protocol === "file:" &&
+        location.href.toLowerCase().includes("/tabs/index.html");
+      const tabChromeCss = isTabChrome ? `
 .root, .root.notion-dark-theme, .root.notion-light-theme, .hide-scrollbar {
   background: transparent !important;
   background-color: transparent !important;
@@ -473,9 +476,18 @@ pub(crate) const EARLY_TRANSPARENCY_SCRIPT: &str = r#"(() => {
   background-image: none !important;
 }
 ` : "";
-    style.textContent = "html,body,.notion-app-inner,.notion-cursor-listener,main.notion-frame,header,.notion-topbar,.notion-sidebar,.notion-sidebar-container,.root,.notion-dark-theme{background:transparent!important;background-color:transparent!important}" +
-      tabChromeCss;
-    (document.documentElement || document).appendChild(style);
+      style.textContent = "html,body,.notion-app-inner,.notion-cursor-listener,main.notion-frame,header,.notion-topbar,.notion-sidebar,.notion-sidebar-container,.root,.notion-dark-theme{background:transparent!important;background-color:transparent!important}" +
+        tabChromeCss;
+      root.appendChild(style);
+      return true;
+    };
+    if (!install()) {
+      const observer = new MutationObserver(() => {
+        if (install()) observer.disconnect();
+      });
+      observer.observe(document, { childList: true });
+      setTimeout(() => observer.disconnect(), 30000);
+    }
   } catch {}
 })()"#;
 
@@ -755,6 +767,8 @@ mod tests {
     #[test]
     fn large_payload_early_script_cleans_tab_chrome() {
         assert!(EARLY_TRANSPARENCY_SCRIPT.contains("/tabs/index.html"));
+        assert!(EARLY_TRANSPARENCY_SCRIPT.contains("root.localName !== \"html\""));
+        assert!(EARLY_TRANSPARENCY_SCRIPT.contains("observer.observe(document"));
         assert!(EARLY_TRANSPARENCY_SCRIPT.contains(".root *"));
         assert!(EARLY_TRANSPARENCY_SCRIPT.contains("box-shadow: none !important"));
         assert!(EARLY_TRANSPARENCY_SCRIPT.contains("[style*="));
@@ -770,6 +784,12 @@ mod tests {
             .find("const state =")
             .expect("state cleanup is present");
         assert!(early_style < state_lookup);
+    }
+
+    #[test]
+    fn full_early_payload_waits_for_the_html_root() {
+        let payload = early_payload_for("window.test = true", "revision-1");
+        assert!(payload.contains("document.documentElement?.localName !== \"html\""));
     }
 
     #[test]
