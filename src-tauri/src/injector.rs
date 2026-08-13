@@ -432,6 +432,24 @@ fn document_revision_probe(revision: &str) -> String {
     )
 }
 
+const VIEWPORT_SIZE_PROBE: &str = r#"({
+  width: Number(window.innerWidth) || 0,
+  height: Number(window.innerHeight) || 0
+})"#;
+
+fn usable_viewport(width: f64, height: f64) -> bool {
+    width >= 1.0 && height >= 1.0
+}
+
+fn session_has_usable_viewport(session: &CdpSession) -> bool {
+    let Ok(value) = session.evaluate(VIEWPORT_SIZE_PROBE) else {
+        return false;
+    };
+    let width = value.get("width").and_then(Value::as_f64).unwrap_or(0.0);
+    let height = value.get("height").and_then(Value::as_f64).unwrap_or(0.0);
+    usable_viewport(width, height)
+}
+
 fn should_apply_payload(
     managed_revision: Option<&str>,
     expected_revision: &str,
@@ -490,6 +508,34 @@ pub(crate) const EARLY_TRANSPARENCY_SCRIPT: &str = r#"(() => {
     }
   } catch {}
 })()"#;
+
+fn apply_managed_session(managed: &mut ManagedSession, payload: &ActivePayload, force: bool) {
+    // Notion 会留一个 0×0 的 /blank 恢复页。那页上 img.decode() 可能一直不返回，
+    // 串行注入时会把标题栏已经换完、正文还停在旧图。没可视面积的页先跳过。
+    if !session_has_usable_viewport(&managed.session) {
+        return;
+    }
+    let document_matches = !force
+        && managed.revision.as_deref() == Some(payload.revision.as_str())
+        && managed
+            .session
+            .document_has_revision(&payload.revision)
+            .unwrap_or(false);
+    if !should_apply_payload(
+        managed.revision.as_deref(),
+        &payload.revision,
+        document_matches,
+        force,
+    ) {
+        return;
+    }
+    if managed.revision.is_some() {
+        managed.revision = None;
+    }
+    if let Err(error) = apply_to_session(managed, payload) {
+        eprintln!("CDP 注入失败: {error}");
+    }
+}
 
 fn apply_to_session(managed: &mut ManagedSession, payload: &ActivePayload) -> Result<(), String> {
     let revision = &payload.revision;
@@ -579,28 +625,16 @@ fn sync_inner(inner: &Arc<Mutex<InjectorInner>>, target_count: &AtomicUsize, for
     if !inner.paused {
         let payload = inner.payload.clone();
         if let Some(payload) = payload {
-            for managed in inner.sessions.values_mut() {
-                let document_matches = !force
-                    && managed.revision.as_deref() == Some(payload.revision.as_str())
-                    && managed
-                        .session
-                        .document_has_revision(&payload.revision)
-                        .unwrap_or(false);
-                if !should_apply_payload(
-                    managed.revision.as_deref(),
-                    &payload.revision,
-                    document_matches,
-                    force,
-                ) {
-                    continue;
+            let mut list: Vec<(String, ManagedSession)> = inner.sessions.drain().collect();
+            thread::scope(|scope| {
+                for chunk in list.chunks_mut(1) {
+                    let payload = &payload;
+                    scope.spawn(move || {
+                        apply_managed_session(&mut chunk[0].1, payload, force);
+                    });
                 }
-                if managed.revision.is_some() {
-                    managed.revision = None;
-                }
-                if let Err(error) = apply_to_session(managed, &payload) {
-                    eprintln!("CDP 注入失败: {error}");
-                }
-            }
+            });
+            inner.sessions.extend(list);
         }
     }
     target_count.store(inner.sessions.len(), Ordering::Relaxed);
@@ -836,6 +870,17 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn skips_zero_size_restore_pages_but_keeps_tab_bar() {
+        assert!(!usable_viewport(0.0, 0.0));
+        assert!(!usable_viewport(1920.0, 0.0));
+        assert!(!usable_viewport(0.0, 996.0));
+        assert!(usable_viewport(1920.0, 36.0));
+        assert!(usable_viewport(1920.0, 996.0));
+        assert!(VIEWPORT_SIZE_PROBE.contains("innerWidth"));
+        assert!(VIEWPORT_SIZE_PROBE.contains("innerHeight"));
     }
 
     #[test]

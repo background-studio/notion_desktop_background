@@ -187,6 +187,8 @@ mod tests {
         assert!(payload
             .script
             .contains("style.dataset.cbgRevision = config.revision"));
+        assert!(payload.script.contains("Promise.race"));
+        assert!(payload.script.contains("background media decode timeout"));
         assert_eq!(payload.revision.len(), 64);
         let _ = fs::remove_dir_all(root);
     }

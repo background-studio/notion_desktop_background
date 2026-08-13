@@ -142,6 +142,15 @@ DOM 更新按 `requestAnimationFrame` 合并。
 处理：从根 class / data theme / `prefers-color-scheme` 检测，设置
 `--cbg-surface-color`。
 
+### 换图后只有标题栏更新，正文要切页面才变
+
+原因：Notion 会留一个 0×0 的 `/blank` 恢复页。那页上 `img.decode()` 即使图片
+已经 `complete` 也可能永不返回。旧注入把所有 target 排成一队，这页卡住后正文
+换不了图；切页面会拆掉恢复页，看起来像「切一下才生效」。
+
+处理：没有可视面积的页跳过注入；各页并行换图；`decode()` 加超时，图片已经
+加载完就继续。
+
 ## 调试策略
 
 ### 推荐

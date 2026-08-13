@@ -381,7 +381,16 @@ export function buildRendererPayload(input: PayloadInput) {
       preparedMedia = document.createElement("img");
       preparedMedia.src = blobUrl;
       try {
-        await preparedMedia.decode();
+        // 0 尺寸 / 冻结的 Notion 恢复页上 decode() 可能永不返回，即使 complete 已是 true。
+        await Promise.race([
+          preparedMedia.decode(),
+          new Promise((resolve, reject) => {
+            setTimeout(() => {
+              if (preparedMedia.complete && preparedMedia.naturalWidth > 0) resolve();
+              else reject(new Error("background media decode timeout"));
+            }, 1500);
+          }),
+        ]);
       } catch (error) {
         if (!preparedMedia.complete || preparedMedia.naturalWidth < 1) throw error;
       }
