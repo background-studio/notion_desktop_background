@@ -189,6 +189,8 @@ mod tests {
             .contains("style.dataset.cbgRevision = config.revision"));
         assert!(payload.script.contains("Promise.race"));
         assert!(payload.script.contains("background media decode timeout"));
+        assert!(payload.script.contains("img:not(.notion-emoji)"));
+        assert!(payload.script.contains("border-color: color-mix"));
         assert_eq!(payload.revision.len(), 64);
         let _ = fs::remove_dir_all(root);
     }

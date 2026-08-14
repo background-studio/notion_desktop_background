@@ -26,7 +26,10 @@ describe("renderer payload", () => {
     expect(payload).toContain('.notion-peek-renderer > div[style*="var(--c-bacEle)"]');
     expect(payload).toContain(".peek-top-hover-area");
     expect(payload).toContain(".notion-peek-renderer .notion-scroller");
-    expect(payload).toContain(".notion-record-icon img");
+    expect(payload).toContain(".notion-record-icon img:not(.notion-emoji)");
+    expect(payload).toContain("img.notion-emoji");
+    expect(payload).toContain("border-color: color-mix");
+    expect(payload).not.toContain("main.notion-frame .notion-record-icon img,");
     expect(payload).toContain("isTabChrome");
     expect(payload).toContain("notion-background-home");
     expect(payload).toContain("notion-background-task");

@@ -51,9 +51,10 @@ Notion class 名和 StyleX hash 可能随版本变化。这里记录的是稳定
 ### 页面图标
 
 - 大图标常是 `main.notion-frame .notion-record-icon img`，未加载时内联
-  `background: var(--c-bacPri)` → 必须清成透明。
-- 表格/侧栏 emoji 走 `img.notion-emoji` + spritesheet `background-image`，
-  不要对内容区写宽泛的 `background-image: none`。
+  `background: var(--c-bacPri)` → 只清 `background-color`，选择器排除
+  `img.notion-emoji`。
+- 表格/侧栏/正文 emoji 走 `img.notion-emoji` + spritesheet `background-image`，
+  不要写 `background: transparent` 简写，否则雪碧图被冲掉，只剩 1×1 GIF。
 
 ### Agent / AI 对话侧栏
 

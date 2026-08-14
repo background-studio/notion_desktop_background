@@ -71,6 +71,13 @@ html.notion-background-active .notion-page-content [style*="--cbg-captured-fill"
     var(--cbg-captured-fill) calc(var(--cbg-block-fill-opacity) * 100%),
     transparent
   ) !important;
+  /* 标注块自带 1px transparent 边。边和底走同一滑杆，避免只剩一圈淡影。 */
+  border-color: color-mix(
+    in srgb,
+    var(--cbg-captured-fill) calc(var(--cbg-block-fill-opacity) * 85%),
+    transparent
+  ) !important;
+  box-shadow: none !important;
 }
 
 html.notion-background-home { --cbg-route-intensity: var(--cbg-home-intensity); }
@@ -158,8 +165,7 @@ html.notion-background-active .notion-peek-renderer [style*="--c-bluBacSec"] {
   backdrop-filter: none !important;
 }
 html.notion-background-active .notion-peek-renderer img[data-cbg-cover="1"],
-html.notion-background-active .notion-peek-renderer .notion-record-icon img {
-  background: transparent !important;
+html.notion-background-active .notion-peek-renderer .notion-record-icon img:not(.notion-emoji) {
   background-color: transparent !important;
 }
 
@@ -171,15 +177,19 @@ html.notion-background-active .notion-peek-renderer .notion-record-icon img {
 html.notion-background-active main.notion-frame img[data-cbg-cover="1"] {
   opacity: calc(0.45 + var(--cbg-surface-opacity) * 0.55) !important;
   visibility: visible !important;
-  background: transparent !important;
   background-color: transparent !important;
 }
 
-/* 页面图标/封面占位：清掉 Notion 的 --c-bacPri 实心底，避免未加载时出现黑方块 */
-html.notion-background-active main.notion-frame .notion-record-icon img,
+/* 自定义页面图标/封面占位：只清 --c-bacPri 色底。
+ * 禁止写 background 简写，否则会冲掉 img.notion-emoji 的雪碧图。 */
+html.notion-background-active main.notion-frame .notion-record-icon img:not(.notion-emoji),
 html.notion-background-active main.notion-frame img[data-cbg-cover="1"] {
-  background: transparent !important;
   background-color: transparent !important;
+}
+
+/* 雪碧图被冲掉后，大号页面 emoji 会停在 Notion 自己的 opacity:0 淡入。 */
+html.notion-background-active img.notion-emoji {
+  opacity: 1 !important;
 }
 
 /* 侧栏 Agent / AI 对话面板（.chat_sidebar 内层仍写死 --c-bacPri） */

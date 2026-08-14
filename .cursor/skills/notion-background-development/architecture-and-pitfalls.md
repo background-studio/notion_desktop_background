@@ -142,6 +142,24 @@ DOM 更新按 `requestAnimationFrame` 合并。
 处理：从根 class / data theme / `prefers-color-scheme` 检测，设置
 `--cbg-surface-color`。
 
+### 透明化后正文 emoji 消失
+
+原因：`img.notion-emoji` 的图案在 CSS 雪碧图上，`src` 只是 1×1 GIF。
+`.notion-record-icon img { background: transparent }` 简写会清掉
+`background-image`。大号页面图标还会停在 Notion 的 `opacity: 0` 淡入。
+
+处理：只清非 emoji 图标的 `background-color`；`img.notion-emoji` 强制
+`opacity: 1`，不要动它的 `background`。
+
+### 灰色标注块看起来只剩一圈阴影
+
+原因：标注块是圆角小卡片（`--c-graBacSec`）。色块底被 color-mix 变淡、
+左边 emoji 被冲掉后，灰底像一块浮着的淡影；自带的 `border: 1px solid
+transparent` 也没有跟着滑杆走。
+
+处理：色块底、边框颜色走同一套 `--cbg-block-fill-opacity`，并去掉残留
+`box-shadow`，让整张卡片一起淡。
+
 ### 换图后只有标题栏更新，正文要切页面才变
 
 原因：Notion 会留一个 0×0 的 `/blank` 恢复页。那页上 `img.decode()` 即使图片
