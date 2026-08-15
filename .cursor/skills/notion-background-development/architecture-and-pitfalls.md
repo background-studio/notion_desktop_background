@@ -94,11 +94,15 @@ DNS 解析结果，拒绝 loopback / 私网等；限制体积、边长、重定�
 
 ### 标签栏与主页背景错位 / 只有一半有图
 
-原因：标签栏是独立 Electron page，高度约 36px；若两页各自 `cover` 自己的
-`innerHeight`，接缝处会对不齐。
+原因：标签栏是独立 Electron page，高度约 36px。旧逻辑用
+`outerHeight - innerHeight` 做主页上移量；在 Windows 还原窗口时，
+`outerHeight` 还包含系统边框（常见再多 ~100px），接缝就会错位。最大化时
+边框变薄，delta 又接近 36，所以表现为「有时候」才出现。
 
-处理：媒体高度统一用 `outerHeight`；标签栏 `top: 0`，主页
-`top: -(outerHeight - innerHeight)`。
+处理：媒体高度仍统一用两边相同的 `outerHeight`（保证 `object-fit: cover`
+裁切一致）；标签栏 `top: 0`；主页 `top: -tabChromeHeight`。
+`tabChromeHeight` 仅在 `outer-inner` ≤ 48px 时采信，否则回退到 Notion
+标签栏实测高度 36px。并监听 `resize` / `visualViewport` 以便最大化还原后立即重算。
 
 ### 滑杆到最低仍有黑边
 

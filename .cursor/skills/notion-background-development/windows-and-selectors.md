@@ -8,12 +8,14 @@ Notion class 名和 StyleX hash 可能随版本变化。这里记录的是稳定
 ### Electron 顶部标签栏（含 Windows 最小化/最大化/关闭那一行）
 
 - 独立 page：`file:///.../app.asar/.webpack/renderer/tabs/index.html`
-- 典型高度约 `36px`；主内容 `innerHeight` ≈ `outerHeight - 36`。
+- 典型高度约 `36px`；主内容在标签栏下方，二者 `innerHeight` 之和才是内容区总高。
+- **不要**用主页的 `outerHeight - innerHeight` 当标签栏高度：Windows 还原窗口时
+  该差值还含系统边框（常到 100px+），会导致标题行与正文背景错位。
 - 根 class：`notion-background-tab-chrome`
 - 处理：清 `.root` / `.hide-scrollbar` 及标签芯片实色底。
 - 标签边缘的暗条是内联 `linear-gradient(var(--gradient-direction, ...))`，不是
   `box-shadow`；需在 Tab Bar 范围内同时清掉 `background-image`。
-- 背景媒体：高度用 `outerHeight`，`top: 0`，与主页共用同一张图。
+- 背景媒体：高度用两边相同的 `outerHeight`，`top: 0`，与主页共用同一张图。
 - Notion 渲染页会拦截本机回环 HTTP 媒体请求，因此媒体仍需内嵌为 data URL。
   大 payload 只做一次实时 `evaluate`；early script 仅注册轻量透明样式，禁止重复发送整图。
 
@@ -21,7 +23,8 @@ Notion class 名和 StyleX hash 可能随版本变化。这里记录的是稳定
 
 - URL：`https://app.notion.com/...` 或 `https://www.notion.so/...`
 - 根 class：`notion-background-active`；空白恢复页额外走 `notion-background-task`
-- 背景媒体：高度用 `outerHeight`，`top: -(outerHeight - innerHeight)`，与标签栏拼图。
+- 背景媒体：高度用 `outerHeight`，`top: -tabChromeHeight`（约 `-36px`；仅当
+  `outer-inner ≤ 48` 时才采信该差值），与标签栏拼图。
 
 ### 左侧边栏
 

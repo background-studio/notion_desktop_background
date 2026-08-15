@@ -99,7 +99,8 @@ Rust 使用 Cargo。Vite 开发地址默认 `http://127.0.0.1:5174/`。
 - 色块底：捕获 `--c-xxxBacSec` 原色到 `--cbg-captured-fill`，用
   `[style*="--cbg-captured-fill"]` 做开关（React 会冲掉 `data-*`）。
 - 标签栏：独立 page，用 `notion-background-tab-chrome`；媒体高度按 `outerHeight`
-  对齐，主页 `top: -(outerHeight - innerHeight)`（约 `-36px`）。
+  对齐，主页 `top: -tabChromeHeight`（约 `-36px`；勿直接用 `outer-inner`，
+  Windows 还原窗口会把系统边框算进去）。
 - 封面图：宽图靠近顶部时打 `data-cbg-cover` 并半透明显示（勿 `visibility:hidden`）。
 - Agent 侧栏：`.chat_sidebar .test123` 等 `--c-bacPri` 实底层跟随 surface。
 - Agent 输入框：`.chat_sidebar` 内 `--c-bacSec` 圆角卡片，需单独覆盖。

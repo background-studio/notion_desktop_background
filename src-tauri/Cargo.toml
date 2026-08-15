@@ -1,6 +1,6 @@
 [package]
 name = "notion-background-studio"
-version = "0.2.9"
+version = "0.2.10"
 description = "A reversible background manager for the Notion Windows desktop app."
 authors = ["Notion Background Studio contributors"]
 license = "MIT"

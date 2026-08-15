@@ -19,6 +19,13 @@ describe("renderer payload", () => {
     expect(payload).toContain("--c-bacEle");
     expect(payload).toContain(".notion-topbar");
     expect(payload).toContain("syncFullWindowMedia");
+    expect(payload).toContain("resolveTabChromeHeight");
+    expect(payload).toContain("DEFAULT_TAB_CHROME_HEIGHT");
+    expect(payload).toContain("MAX_PLAUSIBLE_TAB_CHROME_HEIGHT");
+    expect(payload).toContain('window.addEventListener("resize"');
+    expect(payload).toContain("visualViewport");
+    expect(payload).toContain("tab-chrome-align-v2");
+    expect(payload).not.toContain("shiftY = isTabChrome() ? 0 : -Math.max(0, fullH - viewH)");
     expect(payload).toContain("data-cbg-cover");
     expect(payload).toContain("markNativeCovers");
     expect(payload).toContain(".chat_sidebar");

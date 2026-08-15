@@ -319,6 +319,7 @@ html.notion-background-active .notion-overlay-container .notion-dropdown-menu {
   box-shadow: none !important;
 }
 
+/* tab-chrome-align-v2: Windows outerHeight includes OS frame; do not use outer-inner as tab shift. */
 html.notion-background-dark #notion-background-layer {
   background-color: transparent;
 }
@@ -373,6 +374,11 @@ export function buildRendererPayload(input: PayloadInput) {
     const previous = window[STATE];
     let scheduled = null;
     let shadowPatch = null;
+    // Notion Tab Bar BrowserView is ~36 CSS px. On Windows restored windows,
+    // outerHeight-innerHeight also includes OS frame (~100px+) and must not be
+    // used as the seam shift — that is what makes the title strip look offset.
+    const DEFAULT_TAB_CHROME_HEIGHT = 36;
+    const MAX_PLAUSIBLE_TAB_CHROME_HEIGHT = 48;
 
     const blobUrl = (() => {
       const comma = config.mediaUrl.indexOf(",");
@@ -432,10 +438,21 @@ export function buildRendererPayload(input: PayloadInput) {
 
     const isTabChrome = () => location.protocol === "file:" && location.href.toLowerCase().includes("/tabs/index.html");
 
+    const resolveTabChromeHeight = (viewH) => {
+      if (isTabChrome()) return viewH;
+      const outerH = Number(window.outerHeight) || 0;
+      const delta = Math.max(0, outerH - viewH);
+      // Maximized / thin-frame: delta ≈ real tab height. Restored Windows frame: delta ≫ tab.
+      if (delta > 0 && delta <= MAX_PLAUSIBLE_TAB_CHROME_HEIGHT) return delta;
+      return DEFAULT_TAB_CHROME_HEIGHT;
+    };
+
     const syncFullWindowMedia = (layer, media, tile) => {
-      const fullH = Math.max(Number(window.outerHeight) || 0, Number(window.innerHeight) || 0, 1);
       const viewH = Math.max(Number(window.innerHeight) || 0, 1);
-      const shiftY = isTabChrome() ? 0 : -Math.max(0, fullH - viewH);
+      const tabH = resolveTabChromeHeight(viewH);
+      // outerHeight is shared by tab + main targets; keep cover crop identical across the seam.
+      const fullH = Math.max(Number(window.outerHeight) || 0, viewH + (isTabChrome() ? 0 : tabH), 1);
+      const shiftY = isTabChrome() ? 0 : -tabH;
       layer.style.position = "fixed";
       layer.style.inset = "0";
       layer.style.overflow = "hidden";
@@ -520,11 +537,18 @@ export function buildRendererPayload(input: PayloadInput) {
       });
     };
 
+    const onViewportChange = () => scheduleInstall();
+
     const cleanup = () => {
       const state = window[STATE];
       state?.observer?.disconnect();
       if (state?.timer) clearInterval(state.timer);
       if (scheduled) cancelAnimationFrame(scheduled);
+      window.removeEventListener("resize", onViewportChange);
+      try {
+        window.visualViewport?.removeEventListener("resize", onViewportChange);
+        window.visualViewport?.removeEventListener("scroll", onViewportChange);
+      } catch {}
       if (shadowPatch?.prototype.attachShadow === shadowPatch.wrapped) {
         shadowPatch.prototype.attachShadow = shadowPatch.original;
       }
@@ -697,6 +721,11 @@ export function buildRendererPayload(input: PayloadInput) {
       attributes: true,
       attributeFilter: ["class", "data-theme", "data-appearance"],
     });
+    window.addEventListener("resize", onViewportChange);
+    try {
+      window.visualViewport?.addEventListener("resize", onViewportChange);
+      window.visualViewport?.addEventListener("scroll", onViewportChange);
+    } catch {}
     const timer = setInterval(install, 4000);
     window[STATE] = { revision: config.revision, cleanup, observer, timer, layer: null, blobUrl };
     install();
