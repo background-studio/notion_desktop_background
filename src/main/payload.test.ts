@@ -25,6 +25,10 @@ describe("renderer payload", () => {
     expect(payload).toContain('window.addEventListener("resize"');
     expect(payload).toContain("visualViewport");
     expect(payload).toContain("tab-chrome-align-v2");
+    expect(payload).toContain("hover-install-v3");
+    expect(payload).toContain("Skip no-op writes");
+    expect(payload).toContain("scheduleInstall({ heavy: true })");
+    expect(payload).not.toContain("visualViewport?.addEventListener(\"scroll\"");
     expect(payload).not.toContain("shiftY = isTabChrome() ? 0 : -Math.max(0, fullH - viewH)");
     expect(payload).toContain("data-cbg-cover");
     expect(payload).toContain("markNativeCovers");

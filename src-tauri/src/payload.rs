@@ -195,7 +195,10 @@ mod tests {
         assert!(payload.script.contains("resolveTabChromeHeight"));
         assert!(payload.script.contains("DEFAULT_TAB_CHROME_HEIGHT"));
         assert!(payload.script.contains("tab-chrome-align-v2"));
+        assert!(payload.script.contains("hover-install-v3"));
+        assert!(payload.script.contains("Skip no-op writes"));
         assert!(payload.script.contains(r#"window.addEventListener("resize""#));
+        assert!(!payload.script.contains("visualViewport?.addEventListener(\"scroll\""));
         assert!(!payload
             .script
             .contains("shiftY = isTabChrome() ? 0 : -Math.max(0, fullH - viewH)"));

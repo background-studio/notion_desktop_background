@@ -320,6 +320,7 @@ html.notion-background-active .notion-overlay-container .notion-dropdown-menu {
 }
 
 /* tab-chrome-align-v2: Windows outerHeight includes OS frame; do not use outer-inner as tab shift. */
+/* hover-install-v3: ignore descendant hover class churn; avoid wallpaper jitter. */
 html.notion-background-dark #notion-background-layer {
   background-color: transparent;
 }
@@ -373,6 +374,7 @@ export function buildRendererPayload(input: PayloadInput) {
 
     const previous = window[STATE];
     let scheduled = null;
+    let scheduledRaf = null;
     let shadowPatch = null;
     // Notion Tab Bar BrowserView is ~36 CSS px. On Windows restored windows,
     // outerHeight-innerHeight also includes OS frame (~100px+) and must not be
@@ -453,17 +455,20 @@ export function buildRendererPayload(input: PayloadInput) {
       // outerHeight is shared by tab + main targets; keep cover crop identical across the seam.
       const fullH = Math.max(Number(window.outerHeight) || 0, viewH + (isTabChrome() ? 0 : tabH), 1);
       const shiftY = isTabChrome() ? 0 : -tabH;
-      layer.style.position = "fixed";
-      layer.style.inset = "0";
-      layer.style.overflow = "hidden";
-      layer.style.zIndex = "0";
+      const heightPx = fullH + "px";
+      const topPx = shiftY + "px";
+      if (layer.style.position !== "fixed") layer.style.position = "fixed";
+      if (layer.style.inset !== "0px" && layer.style.inset !== "0") layer.style.inset = "0";
+      if (layer.style.overflow !== "hidden") layer.style.overflow = "hidden";
+      if (layer.style.zIndex !== "0") layer.style.zIndex = "0";
       for (const node of [media, tile]) {
         if (!node) continue;
-        node.style.position = "absolute";
-        node.style.left = "0";
-        node.style.width = "100%";
-        node.style.height = fullH + "px";
-        node.style.top = shiftY + "px";
+        if (node.style.position !== "absolute") node.style.position = "absolute";
+        if (node.style.left !== "0px" && node.style.left !== "0") node.style.left = "0";
+        if (node.style.width !== "100%") node.style.width = "100%";
+        // Skip no-op writes — hover-driven installs used to rewrite these every frame and jitter.
+        if (node.style.height !== heightPx) node.style.height = heightPx;
+        if (node.style.top !== topPx) node.style.top = topPx;
       }
     };
 
@@ -537,17 +542,18 @@ export function buildRendererPayload(input: PayloadInput) {
       });
     };
 
-    const onViewportChange = () => scheduleInstall();
+    const onViewportChange = () => scheduleInstall({ heavy: false });
 
     const cleanup = () => {
       const state = window[STATE];
       state?.observer?.disconnect();
       if (state?.timer) clearInterval(state.timer);
-      if (scheduled) cancelAnimationFrame(scheduled);
+      if (scheduledRaf) cancelAnimationFrame(scheduledRaf);
+      scheduled = null;
+      scheduledRaf = null;
       window.removeEventListener("resize", onViewportChange);
       try {
         window.visualViewport?.removeEventListener("resize", onViewportChange);
-        window.visualViewport?.removeEventListener("scroll", onViewportChange);
       } catch {}
       if (shadowPatch?.prototype.attachShadow === shadowPatch.wrapped) {
         shadowPatch.prototype.attachShadow = shadowPatch.original;
@@ -600,7 +606,8 @@ export function buildRendererPayload(input: PayloadInput) {
       return "light";
     };
 
-    const install = () => {
+    const install = (opts = {}) => {
+      const heavy = opts.heavy !== false;
       const root = document.documentElement;
       if (!root) return false;
 
@@ -670,9 +677,13 @@ export function buildRendererPayload(input: PayloadInput) {
           document.getElementById("notion-background-tile"),
         );
       }
-      markNativeCovers();
-      markSolidSidebarChrome();
-      markBlockFills();
+      // Heavy DOM marking (getBoundingClientRect / queryAll) only on structural sync.
+      // Hover class churn must not thrash layout or the wallpaper looks like it jitters.
+      if (heavy) {
+        markNativeCovers();
+        markSolidSidebarChrome();
+        markBlockFills();
+      }
 
       setClass("notion-background-active", true);
       setClass("notion-background-tab-chrome", isTabChrome());
@@ -705,16 +716,59 @@ export function buildRendererPayload(input: PayloadInput) {
       // Electron can leave the stylesheet declaration at its initial value when
       // the large payload creates the layer before the Notion document finishes mounting.
       if (layer) {
-        layer.style.setProperty("opacity", "calc(var(--cbg-opacity) * var(--cbg-route-intensity))");
+        const opacityValue = "calc(var(--cbg-opacity) * var(--cbg-route-intensity))";
+        if (layer.style.getPropertyValue("opacity") !== opacityValue) {
+          layer.style.setProperty("opacity", opacityValue);
+        }
       }
       return true;
     };
 
-    const scheduleInstall = () => {
-      if (scheduled) return;
-      scheduled = requestAnimationFrame(() => { scheduled = null; install(); });
+    const scheduleInstall = (opts = {}) => {
+      const heavy = opts.heavy !== false;
+      if (scheduled) {
+        if (heavy) scheduled.heavy = true;
+        return;
+      }
+      scheduled = { heavy };
+      scheduledRaf = requestAnimationFrame(() => {
+        const next = scheduled;
+        scheduled = null;
+        scheduledRaf = null;
+        install({ heavy: next?.heavy !== false });
+      });
     };
-    const observer = new MutationObserver(scheduleInstall);
+    const isStudioNode = (node) => {
+      if (!node || node.nodeType !== 1) return false;
+      const id = node.id;
+      return id === LAYER_ID || id === STYLE_ID || id === "notion-background-media"
+        || id === "notion-background-tile" || id === "notion-background-overlay";
+    };
+    const observer = new MutationObserver((mutations) => {
+      let heavy = false;
+      let light = false;
+      for (const mutation of mutations) {
+        if (mutation.type === "attributes") {
+          const target = mutation.target;
+          // Notion toggles hover classes across the tree on every mouse move.
+          // Only theme/root chrome changes should retrigger install.
+          if (target === document.documentElement || target === document.body) light = true;
+          continue;
+        }
+        const target = mutation.target;
+        if (isStudioNode(target) || target?.closest?.("#" + LAYER_ID)) continue;
+        for (const node of mutation.addedNodes) {
+          if (!isStudioNode(node)) { heavy = true; break; }
+        }
+        if (heavy) break;
+        for (const node of mutation.removedNodes) {
+          if (!isStudioNode(node)) { heavy = true; break; }
+        }
+        if (heavy) break;
+      }
+      if (heavy) scheduleInstall({ heavy: true });
+      else if (light) scheduleInstall({ heavy: false });
+    });
     observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
@@ -724,11 +778,10 @@ export function buildRendererPayload(input: PayloadInput) {
     window.addEventListener("resize", onViewportChange);
     try {
       window.visualViewport?.addEventListener("resize", onViewportChange);
-      window.visualViewport?.addEventListener("scroll", onViewportChange);
     } catch {}
-    const timer = setInterval(install, 4000);
+    const timer = setInterval(() => install({ heavy: true }), 4000);
     window[STATE] = { revision: config.revision, cleanup, observer, timer, layer: null, blobUrl };
-    install();
+    install({ heavy: true });
     window[STATE].layer = document.getElementById(LAYER_ID);
     return { installed: true, revision: config.revision, mediaKind: config.mediaKind };
   })(${serialized}, ${css}, ${reviewShadowCss}, ${reviewShadowStyleId})`;

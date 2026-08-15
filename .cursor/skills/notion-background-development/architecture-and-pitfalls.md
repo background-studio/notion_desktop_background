@@ -92,6 +92,16 @@ DNS 解析结果，拒绝 loopback / 私网等；限制体积、边长、重定�
 
 ## 已解决的典型故障
 
+### 鼠标移动时背景图抖动
+
+原因：`MutationObserver` 监听了整棵子树的 `class` 变化。Notion 悬停时会大量
+切换 class，每次都 `install()`，重写背景 `top`/`height`，并对封面图做
+`getBoundingClientRect()`，造成布局抖动。
+
+处理：属性变化只响应 `documentElement` / `body`（主题等）；`childList` 才做
+完整 heavy install。背景几何样式只在数值变化时写入；resize 走轻量路径。
+去掉 `visualViewport` 的 `scroll` 监听。
+
 ### 标签栏与主页背景错位 / 只有一半有图
 
 原因：标签栏是独立 Electron page，高度约 36px。旧逻辑用
