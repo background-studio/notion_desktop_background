@@ -15,7 +15,11 @@ use serde_json::Value;
 use wait_timeout::ChildExt;
 
 use crate::{
-    injector::{read_browser_identity, InjectorEngine},
+    injector::{probe_browser_identity, read_browser_identity, InjectorEngine},
+    managed_launch::{
+        debug_ports_from_records, has_remote_debugging_arg, now_ms, snapshot_matching_executable,
+        ManagedObservation, ProcessKey,
+    },
     models::RuntimeStatus,
     payload::ActivePayload,
     settings::write_json_transaction,
@@ -151,8 +155,7 @@ $version
 "#,
         powershell_quote(&executable.to_string_lossy())
     );
-    run_powershell(&script, Duration::from_secs(15))
-        .unwrap_or_else(|_| "unknown".to_string())
+    run_powershell(&script, Duration::from_secs(15)).unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn discover_notion() -> Result<NotionInstall, String> {
@@ -185,8 +188,10 @@ fn discover_notion() -> Result<NotionInstall, String> {
         }
         return Ok(install);
     }
-    Err("未找到官方 Notion 桌面应用（预期路径：%LOCALAPPDATA%\\Programs\\Notion\\Notion.exe）。"
-        .to_string())
+    Err(
+        "未找到官方 Notion 桌面应用（预期路径：%LOCALAPPDATA%\\Programs\\Notion\\Notion.exe）。"
+            .to_string(),
+    )
 }
 
 fn process_ids_for(install: &NotionInstall) -> Result<Vec<u32>, String> {
@@ -298,11 +303,43 @@ fn select_port(preferred: u16) -> Result<u16, String> {
     Err("无法为 Notion 分配本机调试端口。".to_string())
 }
 
+pub struct TargetProbe {
+    pub processes: Vec<ProcessKey>,
+    pub has_live_debug_session: bool,
+    pub has_debug_launch: bool,
+    pub engine_connected: bool,
+}
+
+impl TargetProbe {
+    pub fn empty() -> Self {
+        Self {
+            processes: Vec::new(),
+            has_live_debug_session: false,
+            has_debug_launch: false,
+            engine_connected: false,
+        }
+    }
+
+    pub fn observation(&self) -> ManagedObservation {
+        ManagedObservation {
+            processes: self.processes.clone(),
+            has_live_debug_session: self.has_live_debug_session,
+            has_debug_launch: self.has_debug_launch,
+            engine_connected: self.engine_connected,
+            now_ms: now_ms(),
+        }
+    }
+}
+
 pub struct NotionController {
     state_path: PathBuf,
     engine: Option<InjectorEngine>,
     state: Option<RuntimeState>,
     status: RuntimeStatus,
+    install_cache: Option<(Instant, NotionInstall)>,
+    managed_mode: bool,
+    managed_paused: bool,
+    rearm_requested: bool,
 }
 
 impl NotionController {
@@ -317,6 +354,10 @@ impl NotionController {
             engine: None,
             state,
             status: RuntimeStatus::default(),
+            install_cache: None,
+            managed_mode: false,
+            managed_paused: false,
+            rearm_requested: false,
         }
     }
 
@@ -338,6 +379,245 @@ impl NotionController {
                 Err(error) => Err(error.to_string()),
             },
         }
+    }
+
+    fn discover_cached(&mut self) -> Result<NotionInstall, String> {
+        if let Some((at, install)) = &self.install_cache {
+            if at.elapsed() < Duration::from_secs(15) && Path::new(&install.executable).is_file() {
+                return Ok(install.clone());
+            }
+        }
+        let install = discover_notion()?;
+        self.install_cache = Some((Instant::now(), install.clone()));
+        Ok(install)
+    }
+
+    fn saved_session_matches(&self, identity: Result<String, String>) -> bool {
+        let Some(state) = &self.state else {
+            return false;
+        };
+        identity.ok().as_deref() == Some(state.browser_id.as_str())
+    }
+
+    fn saved_session_live(&self) -> bool {
+        let Some(state) = &self.state else {
+            return false;
+        };
+        self.saved_session_matches(read_browser_identity(state.port))
+    }
+
+    fn saved_session_probe_live(&self) -> bool {
+        let Some(state) = &self.state else {
+            return false;
+        };
+        self.saved_session_matches(probe_browser_identity(state.port))
+    }
+
+    fn drop_dead_engine(&mut self) {
+        if let Some(mut engine) = self.engine.take() {
+            engine.abandon();
+        }
+    }
+
+    fn mark_managed_applied(&mut self) {
+        if self.managed_mode {
+            self.managed_paused = false;
+            self.rearm_requested = true;
+        }
+    }
+
+    pub fn enable_managed_mode(&mut self) {
+        self.managed_mode = true;
+        if self.engine.is_none() && self.status.phase == "idle" {
+            self.status.message = "已启用，等待 Notion 启动".to_string();
+        }
+    }
+
+    pub fn managed_paused(&self) -> bool {
+        self.managed_paused
+    }
+
+    pub fn take_rearm_request(&mut self) -> bool {
+        let requested = self.rearm_requested;
+        self.rearm_requested = false;
+        requested
+    }
+
+    pub fn engine_is_live(&self) -> bool {
+        self.engine.is_some() && self.saved_session_live()
+    }
+
+    pub fn set_watch_status(&mut self, phase: &str, message: &str) -> bool {
+        if self.managed_paused && phase != "paused" {
+            return false;
+        }
+        if self.status.phase == phase && self.status.message == message {
+            return false;
+        }
+        self.status.phase = phase.to_string();
+        self.status.message = message.to_string();
+        if phase == "error" {
+            self.status.last_error = Some(message.to_string());
+        } else {
+            self.status.last_error = None;
+        }
+        true
+    }
+
+    pub fn probe_target(&mut self) -> Result<TargetProbe, String> {
+        let install = self.discover_cached()?;
+        let records = snapshot_matching_executable(&install.executable)?;
+        let processes = records.iter().map(|record| record.key).collect();
+        let has_debug_launch = records.iter().any(|record| {
+            record
+                .command_line
+                .as_deref()
+                .is_some_and(has_remote_debugging_arg)
+        });
+        let live_saved = self.saved_session_probe_live();
+        let engine_connected = self.engine.is_some() && live_saved;
+        if self.engine.is_some() && !live_saved {
+            self.drop_dead_engine();
+        }
+        let live_from_ports = debug_ports_from_records(&records)
+            .into_iter()
+            .any(|port| probe_browser_identity(port).is_ok());
+        Ok(TargetProbe {
+            processes,
+            has_live_debug_session: live_saved || live_from_ports,
+            has_debug_launch,
+            engine_connected,
+        })
+    }
+
+    pub fn release_stale_session(&mut self) -> Result<(), String> {
+        self.drop_dead_engine();
+        self.write_state(None)?;
+        self.status.active_targets = 0;
+        Ok(())
+    }
+
+    fn try_attach_inner(&mut self, payload: ActivePayload) -> Result<bool, String> {
+        let install = discover_notion()?;
+        if let Some(mut engine) = self.engine.take() {
+            if self.saved_session_live() {
+                match engine.update(payload.clone()) {
+                    Ok(()) => {
+                        self.engine = Some(engine);
+                        self.status.phase = "active".to_string();
+                        self.status.message = "背景已自动应用".to_string();
+                        self.status.notion_version = Some(install.version);
+                        return Ok(true);
+                    }
+                    Err(_) => engine.abandon(),
+                }
+            } else {
+                engine.abandon();
+            }
+        }
+        if self.try_attach_saved(&install) {
+            self.engine
+                .as_mut()
+                .expect("engine set after attach")
+                .start(payload)?;
+            self.status.phase = "active".to_string();
+            self.status.message = "背景已自动应用".to_string();
+            self.status.notion_version = Some(install.version);
+            return Ok(true);
+        }
+        let records = snapshot_matching_executable(&install.executable)?;
+        let mut ports = debug_ports_from_records(&records);
+        if let Some(state) = &self.state {
+            ports.push(state.port);
+        }
+        if ports.is_empty() {
+            if let Ok(extra) = debug_ports_for(&install) {
+                ports.extend(extra);
+            }
+        }
+        ports.sort_unstable();
+        ports.dedup();
+        for port in ports {
+            let Ok(browser_id) = read_browser_identity(port) else {
+                continue;
+            };
+            self.write_state(Some(RuntimeState {
+                schema_version: 1,
+                port,
+                browser_id: browser_id.clone(),
+                package_full_name: install.package_full_name.clone(),
+                executable: install.executable.clone(),
+                created_at: Utc::now().to_rfc3339(),
+            }))?;
+            let mut engine = InjectorEngine::new(port, browser_id);
+            engine.start(payload.clone())?;
+            self.engine = Some(engine);
+            self.status.phase = "active".to_string();
+            self.status.message = "背景已自动应用".to_string();
+            self.status.notion_version = Some(install.version);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub fn try_attach_current(&mut self, payload: ActivePayload) -> Result<bool, String> {
+        self.status.phase = "starting".to_string();
+        self.status.message = "正在接管 Notion".to_string();
+        self.status.last_error = None;
+        match self.try_attach_inner(payload) {
+            Ok(attached) => {
+                if attached {
+                    self.mark_managed_applied();
+                }
+                Ok(attached)
+            }
+            Err(error) => {
+                self.status.phase = "error".to_string();
+                self.status.message = error.clone();
+                self.status.last_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    pub fn takeover_unmanaged(&mut self, payload: ActivePayload) -> Result<RuntimeStatus, String> {
+        self.status.phase = "starting".to_string();
+        self.status.message = "正在接管 Notion".to_string();
+        self.status.last_error = None;
+        let install = match discover_notion() {
+            Ok(install) => install,
+            Err(error) => {
+                self.status.phase = "error".to_string();
+                self.status.message = error.clone();
+                self.status.last_error = Some(error.clone());
+                return Err(error);
+            }
+        };
+        let records = snapshot_matching_executable(&install.executable).unwrap_or_default();
+        if records.iter().any(|record| {
+            record
+                .command_line
+                .as_deref()
+                .is_some_and(has_remote_debugging_arg)
+        }) {
+            return match self.try_attach_current(payload) {
+                Ok(_) => Ok(self.status()),
+                Err(error) => Err(error),
+            };
+        }
+        if let Ok(ports) = debug_ports_for(&install) {
+            if !ports.is_empty() {
+                return match self.try_attach_current(payload) {
+                    Ok(_) => Ok(self.status()),
+                    Err(error) => Err(error),
+                };
+            }
+        }
+        let result = self.apply(payload, true);
+        if result.is_ok() && self.managed_mode {
+            self.status.message = "背景已自动应用".to_string();
+        }
+        result
     }
 
     fn try_attach_saved(&mut self, install: &NotionInstall) -> bool {
@@ -393,16 +673,29 @@ impl NotionController {
         restart_existing: bool,
     ) -> Result<RuntimeStatus, String> {
         self.status.phase = "starting".to_string();
-        self.status.message = "正在连接 Notion".to_string();
+        self.status.message = if self.managed_mode {
+            "正在接管 Notion".to_string()
+        } else {
+            "正在连接 Notion".to_string()
+        };
         self.status.last_error = None;
         let result: Result<RuntimeStatus, String> = (|| {
             let install = discover_notion()?;
-            if let Some(engine) = &self.engine {
-                engine.update(payload)?;
-                self.status.phase = "active".to_string();
-                self.status.message = "背景已实时应用".to_string();
-                self.status.notion_version = Some(install.version);
-                return Ok(self.status());
+            if let Some(mut engine) = self.engine.take() {
+                if self.saved_session_live() {
+                    match engine.update(payload.clone()) {
+                        Ok(()) => {
+                            self.engine = Some(engine);
+                            self.status.phase = "active".to_string();
+                            self.status.message = "背景已实时应用".to_string();
+                            self.status.notion_version = Some(install.version);
+                            return Ok(self.status());
+                        }
+                        Err(_) => engine.abandon(),
+                    }
+                } else {
+                    engine.abandon();
+                }
             }
             if self.try_attach_saved(&install) {
                 self.engine
@@ -484,6 +777,9 @@ impl NotionController {
             self.status.message = error.clone();
             self.status.last_error = Some(error.clone());
         }
+        if result.is_ok() {
+            self.mark_managed_applied();
+        }
         result
     }
 
@@ -492,7 +788,12 @@ impl NotionController {
             engine.pause()?;
         }
         self.status.phase = "paused".to_string();
-        self.status.message = "背景已暂停".to_string();
+        if self.managed_mode {
+            self.managed_paused = true;
+            self.status.message = "暂停托管".to_string();
+        } else {
+            self.status.message = "背景已暂停".to_string();
+        }
         self.status.last_error = None;
         Ok(self.status())
     }
@@ -511,8 +812,14 @@ impl NotionController {
                 launch_notion(&install, &[])?;
             }
             self.write_state(None)?;
-            self.status.phase = "idle".to_string();
-            self.status.message = "已恢复官方外观".to_string();
+            if self.managed_mode {
+                self.managed_paused = true;
+                self.status.phase = "paused".to_string();
+                self.status.message = "暂停托管".to_string();
+            } else {
+                self.status.phase = "idle".to_string();
+                self.status.message = "已恢复官方外观".to_string();
+            }
             self.status.notion_version = Some(install.version);
             self.status.active_targets = 0;
             Ok(self.status())

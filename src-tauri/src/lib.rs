@@ -1,6 +1,7 @@
 mod controller;
 mod host;
 mod injector;
+mod managed_launch;
 mod media;
 mod models;
 mod network;
@@ -19,11 +20,12 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use controller::NotionController;
+use controller::{NotionController, TargetProbe};
+use managed_launch::{ManagedAction, ManagedLaunchMachine};
 use media::MediaLibrary;
 use models::{
-    AppSnapshot, ApplyRequest, DownloadRequest, ImportResult, MediaItem, SettingsPatch,
-    RuntimeStatus, SkippedImport,
+    AppSnapshot, ApplyRequest, DownloadRequest, ImportResult, MediaItem, RuntimeStatus,
+    SettingsPatch, SkippedImport,
 };
 use network::download_remote_media;
 use payload::{build_active_payload, ActivePayload};
@@ -47,6 +49,7 @@ struct StudioState {
     library: Mutex<MediaLibrary>,
     media_server: Mutex<MediaServer>,
     controller: Arc<Mutex<NotionController>>,
+    managed_machine: Mutex<ManagedLaunchMachine>,
     runtime_status: Mutex<RuntimeStatus>,
     tray: Mutex<Option<host::TrayUi>>,
     quitting: AtomicBool,
@@ -73,9 +76,11 @@ impl StudioState {
                 .retain(|id| library.get_by_id(id).is_some());
             if let Some(active) = cleaned.active_media_id.clone() {
                 if library.get_by_id(&active).is_none() {
-                    cleaned.active_media_id = cleaned.playlist_ids.first().cloned().or_else(|| {
-                        library.items().first().map(|item| item.id.clone())
-                    });
+                    cleaned.active_media_id = cleaned
+                        .playlist_ids
+                        .first()
+                        .cloned()
+                        .or_else(|| library.items().first().map(|item| item.id.clone()));
                 }
             }
             if cleaned.playlist_ids.len() != before
@@ -93,6 +98,7 @@ impl StudioState {
             library: Mutex::new(library),
             media_server: Mutex::new(media_server),
             controller: Arc::new(Mutex::new(controller)),
+            managed_machine: Mutex::new(ManagedLaunchMachine::new()),
             runtime_status: Mutex::new(runtime_status),
             tray: Mutex::new(None),
             quitting: AtomicBool::new(false),
@@ -206,6 +212,19 @@ impl StudioState {
         // 读取和编码单张媒体时不占用媒体库锁，预览和后续换图仍可立即响应。
         build_active_payload(&playback_item, &path, &settings.display)
     }
+
+    fn has_selected_media(&self) -> bool {
+        let Ok(settings) = lock(&self.settings) else {
+            return false;
+        };
+        let Some(id) = settings.value().active_media_id else {
+            return false;
+        };
+        lock(&self.library)
+            .ok()
+            .and_then(|library| library.get_by_id(&id))
+            .is_some()
+    }
 }
 
 async fn apply_live_generation(app: &AppHandle, generation: u64) -> Result<(), String> {
@@ -261,10 +280,7 @@ async fn run_live_apply_worker(app: AppHandle) {
         if state.live_apply_generation.load(Ordering::Acquire) == generation {
             break;
         }
-        if state
-            .live_apply_worker_running
-            .swap(true, Ordering::AcqRel)
-        {
+        if state.live_apply_worker_running.swap(true, Ordering::AcqRel) {
             break;
         }
     }
@@ -273,14 +289,18 @@ async fn run_live_apply_worker(app: AppHandle) {
 
 fn queue_live_apply(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<StudioState>();
+    if plugin::is_plugin_mode() {
+        if let Ok(mut machine) = lock(&state.managed_machine) {
+            if machine.payload_failed() && state.has_selected_media() {
+                machine.retry_after_payload_ready();
+            }
+        }
+    }
     if state.runtime_status()?.phase != "active" {
         return Ok(());
     }
     state.live_apply_generation.fetch_add(1, Ordering::AcqRel);
-    if state
-        .live_apply_worker_running
-        .swap(true, Ordering::AcqRel)
-    {
+    if state.live_apply_worker_running.swap(true, Ordering::AcqRel) {
         return Ok(());
     }
     let worker_app = app.clone();
@@ -661,9 +681,7 @@ async fn apply_background(
         if !restart_requested && error.contains("需要重启一次") {
             let confirmed = app
                 .dialog()
-                .message(
-                    "未保存的编辑可能丢失。背景管理器只会关闭路径匹配的官方 Notion.exe 进程。",
-                )
+                .message("未保存的编辑可能丢失。背景管理器只会关闭路径匹配的官方 Notion.exe 进程。")
                 .title("应用背景需要重启一次 Notion")
                 .buttons(MessageDialogButtons::OkCancelCustom(
                     "重启并应用".to_string(),
@@ -686,6 +704,9 @@ async fn apply_background(
             return Err(error);
         }
     }
+    if plugin::is_plugin_mode() {
+        let _ = rearm_managed_machine(&state);
+    }
     state.emit_snapshot(&app)
 }
 
@@ -701,6 +722,7 @@ async fn pause_background(
         .map_err(|error| error.to_string())?;
     let _ = state.refresh_runtime_status();
     result?;
+    pause_managed_machine(&state);
     state.emit_snapshot(&app)
 }
 
@@ -716,6 +738,7 @@ async fn restore_background(
         .map_err(|error| error.to_string())?;
     let _ = state.refresh_runtime_status();
     result?;
+    pause_managed_machine(&state);
     state.emit_snapshot(&app)
 }
 
@@ -736,6 +759,265 @@ pub(crate) fn open_main_window(app: &AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn show_window(app: AppHandle) -> Result<(), String> {
     open_main_window(&app)
+}
+
+enum ManagedTickOutcome {
+    Idle,
+    StatusChanged,
+    Attach,
+    Takeover,
+    ReleaseStale,
+}
+
+pub(crate) fn pause_managed_machine(state: &StudioState) {
+    let _ = lock(&state.managed_machine).map(|mut machine| machine.pause());
+}
+
+pub(crate) fn rearm_managed_machine(state: &StudioState) -> Result<(), String> {
+    let mut controller = lock(&state.controller)?;
+    let mut machine = lock(&state.managed_machine)?;
+    let probe = controller
+        .probe_target()
+        .unwrap_or_else(|_| TargetProbe::empty());
+    machine.resume_and_rearm(&probe.processes, probe.engine_connected);
+    let _ = controller.take_rearm_request();
+    Ok(())
+}
+
+fn prepare_managed_tick(
+    controller: &mut controller::NotionController,
+    machine: &mut ManagedLaunchMachine,
+    state: &StudioState,
+) -> Result<TargetProbe, String> {
+    if controller.take_rearm_request() {
+        let probe = controller.probe_target()?;
+        machine.resume_and_rearm(&probe.processes, probe.engine_connected);
+    }
+    if controller.managed_paused() {
+        machine.pause();
+    }
+    if machine.payload_failed() && state.has_selected_media() {
+        machine.retry_after_payload_ready();
+    }
+    let probe = controller.probe_target()?;
+    machine.ensure_armed(&probe.processes, probe.engine_connected);
+    Ok(probe)
+}
+
+fn classify_managed_tick(app: &AppHandle) -> Result<ManagedTickOutcome, String> {
+    let state = app.state::<StudioState>();
+    let mut controller = lock(&state.controller)?;
+    let mut machine = lock(&state.managed_machine)?;
+    let probe = match prepare_managed_tick(&mut controller, &mut machine, &state) {
+        Ok(probe) => probe,
+        Err(error) => {
+            return Ok(if controller.set_watch_status("error", &error) {
+                ManagedTickOutcome::StatusChanged
+            } else {
+                ManagedTickOutcome::Idle
+            });
+        }
+    };
+    let action = machine.decide(&probe.observation());
+    match action {
+        ManagedAction::Wait | ManagedAction::HoldExisting | ManagedAction::WaitForDebug => {
+            let (phase, message) = machine.watch_status();
+            Ok(if controller.set_watch_status(&phase, &message) {
+                ManagedTickOutcome::StatusChanged
+            } else {
+                ManagedTickOutcome::Idle
+            })
+        }
+        ManagedAction::Attach => Ok(ManagedTickOutcome::Attach),
+        ManagedAction::Takeover => Ok(ManagedTickOutcome::Takeover),
+        ManagedAction::ReleaseStale => Ok(ManagedTickOutcome::ReleaseStale),
+        ManagedAction::Stay => {
+            if controller.status().phase == "error" {
+                let (phase, message) = machine.watch_status();
+                if phase != "error" {
+                    let _ = controller.set_watch_status(&phase, &message);
+                    return Ok(ManagedTickOutcome::StatusChanged);
+                }
+            }
+            Ok(ManagedTickOutcome::Idle)
+        }
+    }
+}
+
+fn apply_managed_action(app: &AppHandle, payload: ActivePayload) -> Result<(), String> {
+    let state = app.state::<StudioState>();
+    let mut controller = lock(&state.controller)?;
+    let mut machine = lock(&state.managed_machine)?;
+    let probe = match prepare_managed_tick(&mut controller, &mut machine, &state) {
+        Ok(probe) => probe,
+        Err(error) => {
+            let _ = controller.set_watch_status("error", &error);
+            return Err(error);
+        }
+    };
+    if controller.managed_paused() {
+        return Ok(());
+    }
+    if probe.engine_connected {
+        machine.mark_active(&probe.processes);
+        return Ok(());
+    }
+    match machine.decide(&probe.observation()) {
+        ManagedAction::Attach => match controller.try_attach_current(payload) {
+            Ok(true) => {
+                let probe = controller
+                    .probe_target()
+                    .unwrap_or_else(|_| TargetProbe::empty());
+                machine.mark_active(&probe.processes);
+                Ok(())
+            }
+            Ok(false) => Ok(()),
+            Err(error) => {
+                let probe = controller
+                    .probe_target()
+                    .unwrap_or_else(|_| TargetProbe::empty());
+                machine.fail_takeover(&probe.processes);
+                Err(error)
+            }
+        },
+        ManagedAction::Takeover => {
+            let applied = controller.takeover_unmanaged(payload);
+            let probe = controller
+                .probe_target()
+                .unwrap_or_else(|_| TargetProbe::empty());
+            if applied.is_ok() && controller.engine_is_live() {
+                machine.mark_active(&probe.processes);
+            } else {
+                machine.fail_takeover(&probe.processes);
+            }
+            applied.map(|_| ())
+        }
+        ManagedAction::ReleaseStale => controller.release_stale_session(),
+        ManagedAction::Wait | ManagedAction::HoldExisting | ManagedAction::WaitForDebug => {
+            let (phase, message) = machine.watch_status();
+            let _ = controller.set_watch_status(&phase, &message);
+            Ok(())
+        }
+        ManagedAction::Stay => Ok(()),
+    }
+}
+
+fn mark_payload_generation_failed(app: &AppHandle, error: &str) {
+    let state = app.state::<StudioState>();
+    let Ok(mut controller) = lock(&state.controller) else {
+        return;
+    };
+    let Ok(mut machine) = lock(&state.managed_machine) else {
+        return;
+    };
+    let processes = controller
+        .probe_target()
+        .map(|probe| probe.processes)
+        .unwrap_or_default();
+    machine.mark_payload_failed(&processes, error);
+    let (phase, message) = machine.watch_status();
+    let _ = controller.set_watch_status(&phase, &message);
+}
+
+async fn run_managed_launch_worker(app: AppHandle) {
+    {
+        let state = app.state::<StudioState>();
+        if let Ok(mut controller) = lock(&state.controller) {
+            controller.enable_managed_mode();
+        }
+        let _ = state.refresh_runtime_status();
+        let _ = state.emit_snapshot(&app);
+    }
+
+    loop {
+        if app.state::<StudioState>().quitting.load(Ordering::SeqCst) {
+            break;
+        }
+        let app_for_tick = app.clone();
+        let outcome = match tauri::async_runtime::spawn_blocking(move || {
+            classify_managed_tick(&app_for_tick)
+        })
+        .await
+        {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) => {
+                eprintln!("托管探测失败：{error}");
+                ManagedTickOutcome::Idle
+            }
+            Err(error) => {
+                eprintln!("托管探测任务失败：{error}");
+                ManagedTickOutcome::Idle
+            }
+        };
+
+        match outcome {
+            ManagedTickOutcome::Attach | ManagedTickOutcome::Takeover => {
+                let app_for_payload = app.clone();
+                let payload = tauri::async_runtime::spawn_blocking(move || {
+                    app_for_payload.state::<StudioState>().active_payload()
+                })
+                .await;
+                match payload {
+                    Ok(Ok(payload)) => {
+                        let app_for_apply = app.clone();
+                        if let Err(error) = tauri::async_runtime::spawn_blocking(move || {
+                            apply_managed_action(&app_for_apply, payload)
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()))
+                        {
+                            eprintln!("托管接管失败：{error}");
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        if !error.contains("请先从媒体库选择") {
+                            eprintln!("托管应用背景失败：{error}");
+                        }
+                        let app_for_fail = app.clone();
+                        let message = error;
+                        let _ = tauri::async_runtime::spawn_blocking(move || {
+                            mark_payload_generation_failed(&app_for_fail, &message);
+                        })
+                        .await;
+                    }
+                    Err(error) => eprintln!("托管任务失败：{error}"),
+                }
+            }
+            ManagedTickOutcome::ReleaseStale => {
+                let app_for_release = app.clone();
+                if let Err(error) = tauri::async_runtime::spawn_blocking(move || {
+                    let state = app_for_release.state::<StudioState>();
+                    let mut controller = lock(&state.controller)?;
+                    controller.release_stale_session()?;
+                    if let Ok(machine) = lock(&state.managed_machine) {
+                        let (phase, message) = machine.watch_status();
+                        let _ = controller.set_watch_status(&phase, &message);
+                    }
+                    Ok::<(), String>(())
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string()))
+                {
+                    eprintln!("清理失效会话失败：{error}");
+                }
+            }
+            _ => {}
+        }
+
+        if !matches!(outcome, ManagedTickOutcome::Idle) {
+            let state = app.state::<StudioState>();
+            let _ = state.refresh_runtime_status();
+            let _ = state.emit_snapshot(&app);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    }
+}
+
+fn start_managed_launch_worker(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        run_managed_launch_worker(app).await;
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -782,6 +1064,7 @@ pub fn run() {
             app.manage(state);
             if plugin_mode {
                 plugin_ipc::start(app.handle().clone());
+                start_managed_launch_worker(app.handle().clone());
             } else {
                 let tray = host::setup_tray(app.handle()).map_err(std::io::Error::other)?;
                 let managed = app.state::<StudioState>();

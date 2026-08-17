@@ -88,9 +88,20 @@ fn validate_websocket_url(
     Ok(url.to_string())
 }
 
+const ATTACH_IDENTITY_TIMEOUT: Duration = Duration::from_secs(3);
+const PROBE_IDENTITY_TIMEOUT: Duration = Duration::from_millis(400);
+
 fn fetch_json<T: for<'de> Deserialize<'de>>(port: u16, resource: &str) -> Result<T, String> {
+    fetch_json_with_timeout(port, resource, ATTACH_IDENTITY_TIMEOUT)
+}
+
+fn fetch_json_with_timeout<T: for<'de> Deserialize<'de>>(
+    port: u16,
+    resource: &str,
+    timeout: Duration,
+) -> Result<T, String> {
     let response = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(3))
+        .timeout(timeout)
         .no_proxy()
         .build()
         .map_err(|error| error.to_string())?
@@ -109,8 +120,7 @@ fn fetch_json<T: for<'de> Deserialize<'de>>(port: u16, resource: &str) -> Result
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
-pub fn read_browser_identity(port: u16) -> Result<String, String> {
-    let version: CdpVersion = fetch_json(port, "/json/version")?;
+fn browser_identity_from_version(port: u16, version: CdpVersion) -> Result<String, String> {
     let websocket =
         validate_websocket_url(&version.web_socket_debugger_url, port, "browser", None)?;
     let url = Url::parse(&websocket).map_err(|error| error.to_string())?;
@@ -122,12 +132,26 @@ pub fn read_browser_identity(port: u16) -> Result<String, String> {
     Ok(id.to_string())
 }
 
+pub fn read_browser_identity(port: u16) -> Result<String, String> {
+    let version: CdpVersion = fetch_json(port, "/json/version")?;
+    browser_identity_from_version(port, version)
+}
+
+pub fn probe_browser_identity(port: u16) -> Result<String, String> {
+    let version: CdpVersion =
+        fetch_json_with_timeout(port, "/json/version", PROBE_IDENTITY_TIMEOUT)?;
+    browser_identity_from_version(port, version)
+}
+
 fn is_main_notion_target_url(value: &str) -> bool {
     let Ok(url) = Url::parse(value) else {
         return false;
     };
     match url.scheme() {
-        "https" => matches!(url.host_str(), Some("app.notion.com") | Some("www.notion.so")),
+        "https" => matches!(
+            url.host_str(),
+            Some("app.notion.com") | Some("www.notion.so")
+        ),
         // Electron 顶部标签栏是独立 page；也要注入，才能和主页面拼成一整张背景。
         "file" => {
             let path = url.path().to_ascii_lowercase().replace('\\', "/");
@@ -743,6 +767,19 @@ impl InjectorEngine {
     pub fn active_targets(&self) -> u32 {
         self.target_count.load(Ordering::Relaxed) as u32
     }
+
+    pub fn abandon(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.paused = true;
+            inner.sessions.clear();
+            inner.payload = None;
+        }
+        self.target_count.store(0, Ordering::Relaxed);
+    }
 }
 
 impl Drop for InjectorEngine {
@@ -779,7 +816,9 @@ mod tests {
         assert!(is_main_notion_target_url(
             "https://app.notion.com/p/example/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
-        assert!(is_main_notion_target_url("https://www.notion.so/workspace/page"));
+        assert!(is_main_notion_target_url(
+            "https://www.notion.so/workspace/page"
+        ));
         assert!(is_main_notion_target_url(
             "file:///C:/Users/example/AppData/Local/Programs/Notion/resources/app.asar/.webpack/renderer/tabs/index.html"
         ));
@@ -787,7 +826,9 @@ mod tests {
             "file:///C:/Users/example/AppData/Local/Programs/Notion/resources/app.asar/.webpack/renderer/other.html"
         ));
         assert!(!is_main_notion_target_url("http://localhost:3000/"));
-        assert!(!is_main_notion_target_url("https://evil.example/app.notion.com"));
+        assert!(!is_main_notion_target_url(
+            "https://evil.example/app.notion.com"
+        ));
     }
 
     #[test]

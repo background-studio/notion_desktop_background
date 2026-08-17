@@ -1,6 +1,6 @@
 {
   "name": "notion-background-studio",
-  "version": "0.2.11",
+  "version": "0.2.12-beta.1",
   "private": true,
   "description": "A reversible background manager for the Notion Windows desktop app.",
   "author": "Notion Background Studio contributors",
