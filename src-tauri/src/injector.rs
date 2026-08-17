@@ -934,14 +934,18 @@ mod tests {
     #[test]
     #[ignore = "requires a live Notion CDP endpoint on port 9226"]
     fn reads_live_notion_with_reqwest() {
-        let body = tauri::async_runtime::block_on(async {
-            reqwest::get("http://127.0.0.1:9226/json/version")
-                .await
-                .expect("connect with reqwest")
-                .text()
-                .await
-                .expect("read response")
-        });
+        let body = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                reqwest::get("http://127.0.0.1:9226/json/version")
+                    .await
+                    .expect("connect with reqwest")
+                    .text()
+                    .await
+                    .expect("read response")
+            });
         assert!(body.contains("webSocketDebuggerUrl"));
     }
 

@@ -1,14 +1,11 @@
 mod controller;
-mod host;
 mod injector;
 mod managed_launch;
-mod media;
 mod models;
-mod network;
 mod payload;
 mod plugin;
 mod plugin_ipc;
-mod preview;
+mod protocol;
 mod settings;
 
 use std::{
@@ -17,24 +14,34 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use controller::{NotionController, TargetProbe};
 use managed_launch::{ManagedAction, ManagedLaunchMachine};
-use media::MediaLibrary;
-use models::{
-    AppSnapshot, ApplyRequest, DownloadRequest, ImportResult, MediaItem, RuntimeStatus,
-    SettingsPatch, SkippedImport,
-};
-use network::download_remote_media;
-use payload::{build_active_payload, ActivePayload};
-use preview::MediaServer;
-use settings::SettingsStore;
-use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
+use models::RuntimeStatus;
+use payload::{build_active_payload_from_bytes, ActivePayload};
+use plugin::UNCONFIGURED_MESSAGE;
+use protocol::{fetch_configured_media, parse_configure, ConfigureCommand};
+use serde_json::{json, Value};
 
-const SNAPSHOT_EVENT: &str = "background:snapshot-changed";
+pub struct ConfiguredSession {
+    pub revision: String,
+    pub payload: ActivePayload,
+}
+
+pub struct WorkerState {
+    pub data_directory: PathBuf,
+    pub controller: Arc<Mutex<NotionController>>,
+    pub managed_machine: Mutex<ManagedLaunchMachine>,
+    pub runtime_status: Mutex<RuntimeStatus>,
+    pub configured: Mutex<Option<ConfiguredSession>>,
+    pub quitting: AtomicBool,
+    pub live_apply_generation: AtomicU64,
+}
+
+fn lock<T>(value: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
+    value.lock().map_err(|_| "应用状态锁已损坏。".to_string())
+}
 
 fn data_directory() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
@@ -43,93 +50,46 @@ fn data_directory() -> PathBuf {
         .join("NotionBackgroundStudio")
 }
 
-struct StudioState {
-    data_directory: PathBuf,
-    settings: Mutex<SettingsStore>,
-    library: Mutex<MediaLibrary>,
-    media_server: Mutex<MediaServer>,
-    controller: Arc<Mutex<NotionController>>,
-    managed_machine: Mutex<ManagedLaunchMachine>,
-    runtime_status: Mutex<RuntimeStatus>,
-    tray: Mutex<Option<host::TrayUi>>,
-    quitting: AtomicBool,
-    slideshow_busy: AtomicBool,
-    live_apply_generation: AtomicU64,
-    live_apply_worker_running: AtomicBool,
-}
+impl WorkerState {
+    pub fn load() -> Result<Self, String> {
+        Self::load_from(data_directory())
+    }
 
-fn lock<T>(value: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
-    value.lock().map_err(|_| "应用状态锁已损坏。".to_string())
-}
-
-impl StudioState {
-    fn load() -> Result<Self, String> {
-        let data_directory = data_directory();
-        let mut settings = SettingsStore::load(&data_directory)?;
-        let mut library = MediaLibrary::load(&data_directory)?;
-        // 旧版批量拷贝会留下成千上万失效 playlistIds，每次存盘/轮播都拖慢 UI。
-        {
-            let mut cleaned = settings.value();
-            let before = cleaned.playlist_ids.len();
-            cleaned
-                .playlist_ids
-                .retain(|id| library.get_by_id(id).is_some());
-            if let Some(active) = cleaned.active_media_id.clone() {
-                if library.get_by_id(&active).is_none() {
-                    cleaned.active_media_id = cleaned
-                        .playlist_ids
-                        .first()
-                        .cloned()
-                        .or_else(|| library.items().first().map(|item| item.id.clone()));
-                }
-            }
-            if cleaned.playlist_ids.len() != before
-                || cleaned.active_media_id != settings.value().active_media_id
-            {
-                settings.save(cleaned)?;
-            }
-        }
-        let media_server = MediaServer::start(&mut library, settings.value().slideshow.order)?;
+    pub fn load_from(data_directory: PathBuf) -> Result<Self, String> {
+        std::fs::create_dir_all(&data_directory).map_err(|error| error.to_string())?;
         let controller = NotionController::load(&data_directory);
         let runtime_status = controller.status();
         Ok(Self {
-            data_directory: data_directory.clone(),
-            settings: Mutex::new(settings),
-            library: Mutex::new(library),
-            media_server: Mutex::new(media_server),
+            data_directory,
             controller: Arc::new(Mutex::new(controller)),
             managed_machine: Mutex::new(ManagedLaunchMachine::new()),
             runtime_status: Mutex::new(runtime_status),
-            tray: Mutex::new(None),
+            configured: Mutex::new(None),
             quitting: AtomicBool::new(false),
-            slideshow_busy: AtomicBool::new(false),
             live_apply_generation: AtomicU64::new(0),
-            live_apply_worker_running: AtomicBool::new(false),
         })
     }
 
-    fn snapshot(&self) -> Result<AppSnapshot, String> {
-        let settings = lock(&self.settings)?.value();
-        let mut library = lock(&self.library)?;
-        library.refresh_folder_sources();
-        let media_server = lock(&self.media_server)?;
-        let items = library
-            .items()
-            .into_iter()
-            .map(|mut item| {
-                item.preview_url = Some(media_server.url_for(&item.id));
-                item
-            })
-            .collect();
-        Ok(AppSnapshot {
-            settings,
-            library: items,
-            runtime: self.runtime_status()?,
-            data_directory: self.data_directory.to_string_lossy().into_owned(),
-        })
+    pub fn is_configured(&self) -> bool {
+        lock(&self.configured)
+            .ok()
+            .is_some_and(|session| session.is_some())
     }
 
-    fn runtime_status(&self) -> Result<RuntimeStatus, String> {
+    pub fn configured_revision(&self) -> Option<String> {
+        lock(&self.configured)
+            .ok()
+            .and_then(|session| session.as_ref().map(|session| session.revision.clone()))
+    }
+
+    pub fn active_payload(&self) -> Result<ActivePayload, String> {
+        lock(&self.configured)?
+            .as_ref()
+            .map(|session| session.payload.clone())
+            .ok_or_else(|| UNCONFIGURED_MESSAGE.to_string())
+    }
+
+    pub fn runtime_status(&self) -> Result<RuntimeStatus, String> {
         if let Ok(controller) = self.controller.try_lock() {
             let status = controller.status();
             *lock(&self.runtime_status)? = status.clone();
@@ -138,642 +98,115 @@ impl StudioState {
         Ok(lock(&self.runtime_status)?.clone())
     }
 
-    fn refresh_runtime_status(&self) -> Result<RuntimeStatus, String> {
+    pub fn refresh_runtime_status(&self) -> Result<RuntimeStatus, String> {
         let status = lock(&self.controller)?.status();
         *lock(&self.runtime_status)? = status.clone();
         Ok(status)
     }
 
-    fn sync_preview(&self) -> Result<(), String> {
-        let order = lock(&self.settings)?.value().slideshow.order;
-        let mut library = lock(&self.library)?;
-        lock(&self.media_server)?.sync(&mut library, order);
-        Ok(())
-    }
-
-    fn integrate_import(&self, result: &ImportResult) -> Result<(), String> {
-        if result.added.is_empty() {
-            return Ok(());
-        }
-        let mut store = lock(&self.settings)?;
-        let mut settings = store.value();
-        let new_ids = result
-            .added
-            .iter()
-            .map(|item| item.id.clone())
-            .collect::<Vec<_>>();
-        if settings.active_media_id.is_none() {
-            settings.active_media_id = new_ids.first().cloned();
-        }
-        for id in new_ids {
-            if !settings.playlist_ids.contains(&id) {
-                settings.playlist_ids.push(id);
-            }
-        }
-        store.save(settings)?;
-        drop(store);
-        self.sync_preview()
-    }
-
-    fn emit_snapshot(&self, app: &AppHandle) -> Result<AppSnapshot, String> {
-        let snapshot = self.snapshot()?;
-        app.emit(SNAPSHOT_EVENT, &snapshot)
-            .map_err(|error| error.to_string())?;
-        if let Ok(tray) = lock(&self.tray) {
-            if let Some(tray) = tray.as_ref() {
-                host::update_tray(app, tray);
-            }
-        }
-        Ok(snapshot)
-    }
-
-    fn active_payload(&self) -> Result<ActivePayload, String> {
-        let settings = lock(&self.settings)?.value();
-        let id = settings
-            .active_media_id
-            .as_deref()
-            .ok_or_else(|| "请先从媒体库选择一张图片或一个视频。".to_string())?;
-        let (playback_item, path) = {
-            let mut library = lock(&self.library)?;
-            let item = library
-                .get_by_id(id)
-                .ok_or_else(|| "请先从媒体库选择一张图片或一个视频。".to_string())?;
-            let resolved =
-                library.resolve_playback(&item, settings.slideshow.order.clone(), false)?;
-            // 文件夹源按实际挑中的文件构造临时条目，保证内嵌修订号与 MIME 正确。
-            let playback_item = MediaItem {
-                kind: resolved.kind.clone(),
-                mime_type: resolved.mime_type.clone(),
-                byte_size: resolved.byte_size,
-                ..item
-            };
-            (playback_item, resolved.path)
+    pub fn status_value(&self) -> Result<Value, String> {
+        let status = self.runtime_status()?;
+        let configured = self.is_configured();
+        let message = if !configured && status.phase != "paused" && status.phase != "error" {
+            UNCONFIGURED_MESSAGE.to_string()
+        } else {
+            status.message
         };
-        // 读取和编码单张媒体时不占用媒体库锁，预览和后续换图仍可立即响应。
-        build_active_payload(&playback_item, &path, &settings.display)
+        Ok(json!({
+            "pluginProtocol": plugin::PLUGIN_PROTOCOL,
+            "pluginId": plugin::PLUGIN_ID,
+            "version": env!("CARGO_PKG_VERSION"),
+            "phase": status.phase,
+            "message": message,
+            "activeTargets": status.active_targets,
+            "paused": status.phase == "paused",
+            "configured": configured,
+            "revision": self.configured_revision(),
+        }))
     }
 
-    fn has_selected_media(&self) -> bool {
-        let Ok(settings) = lock(&self.settings) else {
-            return false;
-        };
-        let Some(id) = settings.value().active_media_id else {
-            return false;
-        };
-        lock(&self.library)
-            .ok()
-            .and_then(|library| library.get_by_id(&id))
-            .is_some()
+    pub async fn configure(&self, params: Option<&Value>) -> Result<Value, String> {
+        let command = parse_configure(params)?;
+        let bytes = fetch_configured_media(&command.media).await?;
+        let payload = build_active_payload_from_bytes(
+            bytes,
+            command.media.mime_type.clone(),
+            &command.media.kind,
+            &command.display,
+        )?;
+        self.store_configuration(command, payload)?;
+        self.status_value()
     }
-}
 
-async fn apply_live_generation(app: &AppHandle, generation: u64) -> Result<(), String> {
-    let state = app.state::<StudioState>();
-    if state.runtime_status()?.phase != "active"
-        || state.live_apply_generation.load(Ordering::Acquire) != generation
-    {
-        return Ok(());
-    }
-    let app_for_payload = app.clone();
-    let payload = match tauri::async_runtime::spawn_blocking(move || {
-        app_for_payload.state::<StudioState>().active_payload()
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    {
-        Ok(payload) => payload,
-        Err(error) if error.contains("请先从媒体库选择") => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if state.live_apply_generation.load(Ordering::Acquire) != generation
-        || state.runtime_status()?.phase != "active"
-    {
-        return Ok(());
-    }
-    let controller = Arc::clone(&state.controller);
-    let result =
-        tauri::async_runtime::spawn_blocking(move || lock(&controller)?.apply(payload, false))
-            .await
-            .map_err(|error| error.to_string())?;
-    let _ = state.refresh_runtime_status();
-    result?;
-    Ok(())
-}
-
-async fn run_live_apply_worker(app: AppHandle) {
-    loop {
-        let generation = app
-            .state::<StudioState>()
-            .live_apply_generation
-            .load(Ordering::Acquire);
-        if let Err(error) = apply_live_generation(&app, generation).await {
-            eprintln!("后台应用背景失败：{error}");
-        }
-
-        let state = app.state::<StudioState>();
-        if state.live_apply_generation.load(Ordering::Acquire) != generation {
-            continue;
-        }
-        state
-            .live_apply_worker_running
-            .store(false, Ordering::Release);
-        if state.live_apply_generation.load(Ordering::Acquire) == generation {
-            break;
-        }
-        if state.live_apply_worker_running.swap(true, Ordering::AcqRel) {
-            break;
-        }
-    }
-    let _ = app.state::<StudioState>().emit_snapshot(&app);
-}
-
-fn queue_live_apply(app: &AppHandle) -> Result<(), String> {
-    let state = app.state::<StudioState>();
-    if plugin::is_plugin_mode() {
-        if let Ok(mut machine) = lock(&state.managed_machine) {
-            if machine.payload_failed() && state.has_selected_media() {
+    fn store_configuration(
+        &self,
+        command: ConfigureCommand,
+        payload: ActivePayload,
+    ) -> Result<(), String> {
+        let was_active = self.runtime_status()?.phase == "active";
+        *lock(&self.configured)? = Some(ConfiguredSession {
+            revision: command.revision,
+            payload: payload.clone(),
+        });
+        if let Ok(mut machine) = lock(&self.managed_machine) {
+            if machine.payload_failed() {
                 machine.retry_after_payload_ready();
             }
         }
-    }
-    if state.runtime_status()?.phase != "active" {
-        return Ok(());
-    }
-    state.live_apply_generation.fetch_add(1, Ordering::AcqRel);
-    if state.live_apply_worker_running.swap(true, Ordering::AcqRel) {
-        return Ok(());
-    }
-    let worker_app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        run_live_apply_worker(worker_app).await;
-    });
-    Ok(())
-}
-
-async fn refresh_dynamic_item(state: &StudioState, id: &str) -> Result<(), String> {
-    let (source_url, temporary_directory) = {
-        let library = lock(&state.library)?;
-        let item = library
-            .get_by_id(id)
-            .ok_or_else(|| "媒体项目不存在。".to_string())?;
-        if item.origin != models::MediaOrigin::Api {
-            return Err("该媒体不是随机 API 来源。".to_string());
+        if was_active {
+            lock(&self.controller)?.apply(payload, false)?;
+            let _ = self.refresh_runtime_status();
         }
-        (
-            item.source_url
-                .ok_or_else(|| "随机 API 条目缺少来源地址。".to_string())?,
-            library.temporary_directory.clone(),
-        )
-    };
-    let download = download_remote_media(&source_url, &temporary_directory).await?;
-    lock(&state.library)?.refresh_with_download(id, download)?;
-    Ok(())
-}
-
-fn advance_folder_source(
-    library: &Mutex<MediaLibrary>,
-    id: &str,
-    order: models::SlideshowOrder,
-) -> Result<(), String> {
-    let mut library = lock(library)?;
-    let item = library
-        .get_by_id(id)
-        .ok_or_else(|| "媒体项目不存在。".to_string())?;
-    library.advance_folder_cursor(&item, order)
-}
-
-async fn advance_slideshow(app: AppHandle) -> Result<(), String> {
-    let state = app.state::<StudioState>();
-    if state.slideshow_busy.swap(true, Ordering::SeqCst) {
-        return Ok(());
-    }
-    let result = async {
-        let settings = lock(&state.settings)?.value();
-        if !settings.slideshow.enabled {
-            return Ok(());
-        }
-        let candidates = {
-            let library = lock(&state.library)?;
-            let mut candidates = settings
-                .playlist_ids
-                .iter()
-                .filter(|id| library.get_by_id(id).is_some())
-                .cloned()
-                .collect::<Vec<_>>();
-            if candidates.is_empty() {
-                candidates = library.items().iter().map(|item| item.id.clone()).collect();
-            }
-            candidates
-        };
-        if candidates.is_empty() {
-            return Ok(());
-        }
-        let refreshable = |id: &str| -> Result<bool, String> {
-            Ok(lock(&state.library)?
-                .get_by_id(id)
-                .map(|item| {
-                    matches!(
-                        item.origin,
-                        models::MediaOrigin::Api | models::MediaOrigin::Folder
-                    )
-                })
-                .unwrap_or(false))
-        };
-        if candidates.len() == 1 {
-            if !refreshable(&candidates[0])? {
-                return Ok(());
-            }
-        }
-        let next_id = match settings.slideshow.order {
-            models::SlideshowOrder::Sequential => {
-                let current = settings
-                    .active_media_id
-                    .as_ref()
-                    .and_then(|active| candidates.iter().position(|id| id == active));
-                candidates[(current.map(|index| index + 1).unwrap_or(0)) % candidates.len()].clone()
-            }
-            models::SlideshowOrder::Random => {
-                let choices = if candidates.len() > 1 {
-                    candidates
-                        .iter()
-                        .filter(|id| Some(id.as_str()) != settings.active_media_id.as_deref())
-                        .collect::<Vec<_>>()
-                } else {
-                    candidates.iter().collect()
-                };
-                let seed = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|duration| duration.as_nanos())
-                    .unwrap_or_default();
-                (*choices[(seed % choices.len() as u128) as usize]).clone()
-            }
-        };
-        let next_item = lock(&state.library)?.get_by_id(&next_id);
-        match next_item.map(|item| item.origin) {
-            Some(models::MediaOrigin::Api) => {
-                // 网络抖动时沿用这个 API 条目的现有缓存，轮播仍继续。
-                let _ = refresh_dynamic_item(&state, &next_id).await;
-            }
-            Some(models::MediaOrigin::Folder) => {
-                let same_item = settings.active_media_id.as_deref() == Some(next_id.as_str());
-                if same_item {
-                    let order = settings.slideshow.order.clone();
-                    advance_folder_source(&state.library, &next_id, order)?;
-                }
-            }
-            _ => {}
-        }
-        {
-            let mut store = lock(&state.settings)?;
-            let mut updated = store.value();
-            updated.active_media_id = Some(next_id);
-            store.save(updated)?;
-        }
-        state.sync_preview()?;
-        state.emit_snapshot(&app)?;
-        queue_live_apply(&app)?;
         Ok(())
     }
-    .await;
-    state.slideshow_busy.store(false, Ordering::SeqCst);
-    result
-}
 
-fn start_slideshow_scheduler(app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        let mut last_tick = Instant::now();
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let state = app.state::<StudioState>();
-            let (enabled, interval, active) = {
-                let settings = lock(&state.settings)
-                    .map(|store| store.value())
-                    .unwrap_or_default();
-                let active = state
-                    .runtime_status()
-                    .map(|status| status.phase == "active")
-                    .unwrap_or(false);
-                (
-                    settings.slideshow.enabled,
-                    settings.slideshow.interval_seconds.max(5),
-                    active,
-                )
-            };
-            if !enabled || !active {
-                last_tick = Instant::now();
-                continue;
+    pub fn apply(&self) -> Result<Value, String> {
+        let payload = self.active_payload()?;
+        let mut controller = lock(&self.controller)?;
+        match controller.apply(payload.clone(), false) {
+            Ok(_) => {}
+            Err(error) if error.contains("需要重启一次") => {
+                controller.apply(payload, true)?;
             }
-            if last_tick.elapsed().as_secs() < interval {
-                continue;
-            }
-            last_tick = Instant::now();
-            let _ = advance_slideshow(app.clone()).await;
+            Err(error) => return Err(error),
         }
-    });
-}
-
-#[tauri::command]
-fn get_snapshot(state: State<'_, StudioState>) -> Result<AppSnapshot, String> {
-    state.snapshot()
-}
-
-#[tauri::command]
-async fn choose_media_files(
-    app: AppHandle,
-    state: State<'_, StudioState>,
-) -> Result<ImportResult, String> {
-    let paths = app
-        .dialog()
-        .file()
-        .set_title("选择背景图片或视频")
-        .add_filter(
-            "图片和视频",
-            &[
-                "png", "jpg", "jpeg", "webp", "gif", "avif", "mp4", "webm", "ogv", "mov",
-            ],
-        )
-        .blocking_pick_files()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|path| path.into_path().ok())
-        .collect::<Vec<_>>();
-    if paths.is_empty() {
-        return Ok(ImportResult::default());
+        drop(controller);
+        rearm_managed_machine(self)?;
+        let _ = self.refresh_runtime_status();
+        self.status_value()
     }
-    let result = lock(&state.library)?.import_files(&paths);
-    state.integrate_import(&result)?;
-    state.emit_snapshot(&app)?;
-    queue_live_apply(&app)?;
-    Ok(result)
-}
 
-#[tauri::command]
-async fn choose_media_folder(
-    app: AppHandle,
-    state: State<'_, StudioState>,
-) -> Result<ImportResult, String> {
-    let Some(folder) = app
-        .dialog()
-        .file()
-        .set_title("添加背景文件夹")
-        .blocking_pick_folder()
-        .and_then(|path| path.into_path().ok())
-    else {
-        return Ok(ImportResult::default());
-    };
-    let result = lock(&state.library)?.import_folder(&folder);
-    state.integrate_import(&result)?;
-    state.emit_snapshot(&app)?;
-    queue_live_apply(&app)?;
-    Ok(result)
-}
-
-#[tauri::command]
-async fn add_remote_media(
-    app: AppHandle,
-    state: State<'_, StudioState>,
-    request: DownloadRequest,
-) -> Result<ImportResult, String> {
-    if request.url.len() > 4096 {
-        return Err("网络地址无效。".to_string());
+    pub fn pause(&self) -> Result<Value, String> {
+        self.live_apply_generation.fetch_add(1, Ordering::AcqRel);
+        lock(&self.controller)?.pause()?;
+        pause_managed_machine(self);
+        let _ = self.refresh_runtime_status();
+        self.status_value()
     }
-    let temporary_directory = lock(&state.library)?.temporary_directory.clone();
-    let download = match download_remote_media(&request.url, &temporary_directory).await {
-        Ok(download) => download,
-        Err(error) => {
-            return Ok(ImportResult {
-                added: Vec::new(),
-                skipped: vec![SkippedImport {
-                    path: request.url,
-                    reason: error,
-                }],
-            });
-        }
-    };
-    let result = lock(&state.library)?.import_download(&request.url, request.dynamic, download);
-    state.integrate_import(&result)?;
-    state.emit_snapshot(&app)?;
-    queue_live_apply(&app)?;
-    Ok(result)
-}
 
-#[tauri::command]
-async fn refresh_media(
-    app: AppHandle,
-    state: State<'_, StudioState>,
-    id: String,
-) -> Result<AppSnapshot, String> {
-    let origin = lock(&state.library)?
-        .get_by_id(&id)
-        .map(|item| item.origin)
-        .ok_or_else(|| "媒体项目不存在。".to_string())?;
-    match origin {
-        models::MediaOrigin::Api => {
-            refresh_dynamic_item(&state, &id).await?;
-        }
-        models::MediaOrigin::Folder => {
-            let order = lock(&state.settings)?.value().slideshow.order;
-            advance_folder_source(&state.library, &id, order)?;
-        }
-        _ => return Err("该媒体不支持刷新。".to_string()),
+    pub fn restore(&self) -> Result<Value, String> {
+        self.live_apply_generation.fetch_add(1, Ordering::AcqRel);
+        lock(&self.controller)?.restore()?;
+        pause_managed_machine(self);
+        let _ = self.refresh_runtime_status();
+        self.status_value()
     }
-    state.sync_preview()?;
-    let snapshot = state.emit_snapshot(&app)?;
-    queue_live_apply(&app)?;
-    Ok(snapshot)
-}
 
-#[tauri::command]
-async fn remove_media(
-    app: AppHandle,
-    state: State<'_, StudioState>,
-    id: String,
-) -> Result<AppSnapshot, String> {
-    lock(&state.library)?.remove(&id)?;
-    {
-        let mut store = lock(&state.settings)?;
-        let mut settings = store.value();
-        settings.playlist_ids.retain(|candidate| candidate != &id);
-        if settings.active_media_id.as_deref() == Some(id.as_str()) {
-            settings.active_media_id = settings.playlist_ids.first().cloned().or_else(|| {
-                lock(&state.library)
-                    .ok()?
-                    .items()
-                    .first()
-                    .map(|item| item.id.clone())
-            });
-        }
-        store.save(settings)?;
+    pub fn shutdown(&self) -> Value {
+        self.quitting.store(true, Ordering::SeqCst);
+        json!({ "shutdown": true, "keptTarget": true })
     }
-    state.sync_preview()?;
-    let snapshot = state.emit_snapshot(&app)?;
-    queue_live_apply(&app)?;
-    Ok(snapshot)
 }
 
-#[tauri::command]
-async fn set_active_media(
-    app: AppHandle,
-    state: State<'_, StudioState>,
-    id: String,
-) -> Result<AppSnapshot, String> {
-    if lock(&state.library)?.get_by_id(&id).is_none() {
-        return Err("媒体项目不存在。".to_string());
-    }
-    {
-        let mut store = lock(&state.settings)?;
-        let mut settings = store.value();
-        settings.active_media_id = Some(id.clone());
-        if !settings.playlist_ids.contains(&id) {
-            settings.playlist_ids.push(id);
-        }
-        store.save(settings)?;
-    }
-    state.sync_preview()?;
-    let snapshot = state.emit_snapshot(&app)?;
-    queue_live_apply(&app)?;
-    Ok(snapshot)
+pub fn allows_managed_takeover(configured: bool, action: ManagedAction) -> bool {
+    configured && matches!(action, ManagedAction::Attach | ManagedAction::Takeover)
 }
 
-#[tauri::command]
-async fn update_settings(
-    app: AppHandle,
-    state: State<'_, StudioState>,
-    patch: SettingsPatch,
-) -> Result<AppSnapshot, String> {
-    let behavior = lock(&state.settings)?.patch(patch)?.behavior;
-    if !plugin::is_plugin_mode() {
-        host::sync_autostart(behavior.auto_start_with_windows, behavior.start_minimized)?;
-    }
-    state.sync_preview()?;
-    let snapshot = state.emit_snapshot(&app)?;
-    queue_live_apply(&app)?;
-    Ok(snapshot)
-}
-
-#[tauri::command]
-async fn apply_background(
-    app: AppHandle,
-    state: State<'_, StudioState>,
-    request: Option<ApplyRequest>,
-) -> Result<AppSnapshot, String> {
-    let app_for_payload = app.clone();
-    let payload = tauri::async_runtime::spawn_blocking(move || {
-        let state = app_for_payload.state::<StudioState>();
-        state.active_payload()
-    })
-    .await
-    .map_err(|error| error.to_string())??;
-    let restart_requested = request
-        .and_then(|request| request.restart_existing)
-        .unwrap_or(false);
-    let run_apply = |restart_existing: bool, payload: ActivePayload| {
-        let controller = Arc::clone(&state.controller);
-        tauri::async_runtime::spawn_blocking(move || {
-            lock(&controller)?.apply(payload, restart_existing)
-        })
-    };
-    let first = run_apply(restart_requested, payload.clone())
-        .await
-        .map_err(|error| error.to_string())?;
-    let _ = state.refresh_runtime_status();
-    if let Err(error) = first {
-        if !restart_requested && error.contains("需要重启一次") {
-            let confirmed = app
-                .dialog()
-                .message("未保存的编辑可能丢失。背景管理器只会关闭路径匹配的官方 Notion.exe 进程。")
-                .title("应用背景需要重启一次 Notion")
-                .buttons(MessageDialogButtons::OkCancelCustom(
-                    "重启并应用".to_string(),
-                    "取消".to_string(),
-                ))
-                .blocking_show();
-            if !confirmed {
-                return state.emit_snapshot(&app);
-            }
-            let retry = run_apply(true, payload)
-                .await
-                .map_err(|error| error.to_string())?;
-            let _ = state.refresh_runtime_status();
-            if let Err(error) = retry {
-                let _ = state.emit_snapshot(&app);
-                return Err(error);
-            }
-        } else {
-            let _ = state.emit_snapshot(&app);
-            return Err(error);
-        }
-    }
-    if plugin::is_plugin_mode() {
-        let _ = rearm_managed_machine(&state);
-    }
-    state.emit_snapshot(&app)
-}
-
-#[tauri::command]
-async fn pause_background(
-    app: AppHandle,
-    state: State<'_, StudioState>,
-) -> Result<AppSnapshot, String> {
-    state.live_apply_generation.fetch_add(1, Ordering::AcqRel);
-    let controller = Arc::clone(&state.controller);
-    let result = tauri::async_runtime::spawn_blocking(move || lock(&controller)?.pause())
-        .await
-        .map_err(|error| error.to_string())?;
-    let _ = state.refresh_runtime_status();
-    result?;
-    pause_managed_machine(&state);
-    state.emit_snapshot(&app)
-}
-
-#[tauri::command]
-async fn restore_background(
-    app: AppHandle,
-    state: State<'_, StudioState>,
-) -> Result<AppSnapshot, String> {
-    state.live_apply_generation.fetch_add(1, Ordering::AcqRel);
-    let controller = Arc::clone(&state.controller);
-    let result = tauri::async_runtime::spawn_blocking(move || lock(&controller)?.restore())
-        .await
-        .map_err(|error| error.to_string())?;
-    let _ = state.refresh_runtime_status();
-    result?;
-    pause_managed_machine(&state);
-    state.emit_snapshot(&app)
-}
-
-#[tauri::command]
-fn open_data_directory(state: State<'_, StudioState>) -> Result<(), String> {
-    host::open_data_directory(&state.data_directory)
-}
-
-pub(crate) fn open_main_window(app: &AppHandle) -> Result<(), String> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "找不到主窗口。".to_string())?;
-    window.show().map_err(|error| error.to_string())?;
-    window.unminimize().map_err(|error| error.to_string())?;
-    window.set_focus().map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-fn show_window(app: AppHandle) -> Result<(), String> {
-    open_main_window(&app)
-}
-
-enum ManagedTickOutcome {
-    Idle,
-    StatusChanged,
-    Attach,
-    Takeover,
-    ReleaseStale,
-}
-
-pub(crate) fn pause_managed_machine(state: &StudioState) {
+pub(crate) fn pause_managed_machine(state: &WorkerState) {
     let _ = lock(&state.managed_machine).map(|mut machine| machine.pause());
 }
 
-pub(crate) fn rearm_managed_machine(state: &StudioState) -> Result<(), String> {
+pub(crate) fn rearm_managed_machine(state: &WorkerState) -> Result<(), String> {
     let mut controller = lock(&state.controller)?;
     let mut machine = lock(&state.managed_machine)?;
     let probe = controller
@@ -784,10 +217,18 @@ pub(crate) fn rearm_managed_machine(state: &StudioState) -> Result<(), String> {
     Ok(())
 }
 
+enum ManagedTickOutcome {
+    Idle,
+    StatusChanged,
+    Attach,
+    Takeover,
+    ReleaseStale,
+}
+
 fn prepare_managed_tick(
-    controller: &mut controller::NotionController,
+    controller: &mut NotionController,
     machine: &mut ManagedLaunchMachine,
-    state: &StudioState,
+    state: &WorkerState,
 ) -> Result<TargetProbe, String> {
     if controller.take_rearm_request() {
         let probe = controller.probe_target()?;
@@ -796,7 +237,7 @@ fn prepare_managed_tick(
     if controller.managed_paused() {
         machine.pause();
     }
-    if machine.payload_failed() && state.has_selected_media() {
+    if machine.payload_failed() && state.is_configured() {
         machine.retry_after_payload_ready();
     }
     let probe = controller.probe_target()?;
@@ -804,11 +245,20 @@ fn prepare_managed_tick(
     Ok(probe)
 }
 
-fn classify_managed_tick(app: &AppHandle) -> Result<ManagedTickOutcome, String> {
-    let state = app.state::<StudioState>();
+fn classify_managed_tick(state: &WorkerState) -> Result<ManagedTickOutcome, String> {
+    if !state.is_configured() {
+        let mut controller = lock(&state.controller)?;
+        return Ok(
+            if controller.set_watch_status("idle", UNCONFIGURED_MESSAGE) {
+                ManagedTickOutcome::StatusChanged
+            } else {
+                ManagedTickOutcome::Idle
+            },
+        );
+    }
     let mut controller = lock(&state.controller)?;
     let mut machine = lock(&state.managed_machine)?;
-    let probe = match prepare_managed_tick(&mut controller, &mut machine, &state) {
+    let probe = match prepare_managed_tick(&mut controller, &mut machine, state) {
         Ok(probe) => probe,
         Err(error) => {
             return Ok(if controller.set_watch_status("error", &error) {
@@ -844,18 +294,17 @@ fn classify_managed_tick(app: &AppHandle) -> Result<ManagedTickOutcome, String> 
     }
 }
 
-fn apply_managed_action(app: &AppHandle, payload: ActivePayload) -> Result<(), String> {
-    let state = app.state::<StudioState>();
+fn apply_managed_action(state: &WorkerState, payload: ActivePayload) -> Result<(), String> {
     let mut controller = lock(&state.controller)?;
     let mut machine = lock(&state.managed_machine)?;
-    let probe = match prepare_managed_tick(&mut controller, &mut machine, &state) {
+    let probe = match prepare_managed_tick(&mut controller, &mut machine, state) {
         Ok(probe) => probe,
         Err(error) => {
             let _ = controller.set_watch_status("error", &error);
             return Err(error);
         }
     };
-    if controller.managed_paused() {
+    if controller.managed_paused() || !state.is_configured() {
         return Ok(());
     }
     if probe.engine_connected {
@@ -902,8 +351,7 @@ fn apply_managed_action(app: &AppHandle, payload: ActivePayload) -> Result<(), S
     }
 }
 
-fn mark_payload_generation_failed(app: &AppHandle, error: &str) {
-    let state = app.state::<StudioState>();
+fn mark_payload_generation_failed(state: &WorkerState, error: &str) {
     let Ok(mut controller) = lock(&state.controller) else {
         return;
     };
@@ -919,49 +367,42 @@ fn mark_payload_generation_failed(app: &AppHandle, error: &str) {
     let _ = controller.set_watch_status(&phase, &message);
 }
 
-async fn run_managed_launch_worker(app: AppHandle) {
-    {
-        let state = app.state::<StudioState>();
-        if let Ok(mut controller) = lock(&state.controller) {
-            controller.enable_managed_mode();
+async fn run_managed_launch_worker(state: Arc<WorkerState>) {
+    if let Ok(mut controller) = lock(&state.controller) {
+        controller.enable_managed_mode();
+        if !state.is_configured() {
+            let _ = controller.set_watch_status("idle", UNCONFIGURED_MESSAGE);
         }
-        let _ = state.refresh_runtime_status();
-        let _ = state.emit_snapshot(&app);
     }
+    let _ = state.refresh_runtime_status();
 
     loop {
-        if app.state::<StudioState>().quitting.load(Ordering::SeqCst) {
+        if state.quitting.load(Ordering::SeqCst) {
             break;
         }
-        let app_for_tick = app.clone();
-        let outcome = match tauri::async_runtime::spawn_blocking(move || {
-            classify_managed_tick(&app_for_tick)
-        })
-        .await
-        {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(error)) => {
-                eprintln!("托管探测失败：{error}");
-                ManagedTickOutcome::Idle
-            }
-            Err(error) => {
-                eprintln!("托管探测任务失败：{error}");
-                ManagedTickOutcome::Idle
-            }
-        };
+        let worker = Arc::clone(&state);
+        let outcome =
+            match tokio::task::spawn_blocking(move || classify_managed_tick(&worker)).await {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(error)) => {
+                    eprintln!("托管探测失败：{error}");
+                    ManagedTickOutcome::Idle
+                }
+                Err(error) => {
+                    eprintln!("托管探测任务失败：{error}");
+                    ManagedTickOutcome::Idle
+                }
+            };
 
         match outcome {
             ManagedTickOutcome::Attach | ManagedTickOutcome::Takeover => {
-                let app_for_payload = app.clone();
-                let payload = tauri::async_runtime::spawn_blocking(move || {
-                    app_for_payload.state::<StudioState>().active_payload()
-                })
-                .await;
+                let worker = Arc::clone(&state);
+                let payload = tokio::task::spawn_blocking(move || worker.active_payload()).await;
                 match payload {
                     Ok(Ok(payload)) => {
-                        let app_for_apply = app.clone();
-                        if let Err(error) = tauri::async_runtime::spawn_blocking(move || {
-                            apply_managed_action(&app_for_apply, payload)
+                        let worker = Arc::clone(&state);
+                        if let Err(error) = tokio::task::spawn_blocking(move || {
+                            apply_managed_action(&worker, payload)
                         })
                         .await
                         .unwrap_or_else(|error| Err(error.to_string()))
@@ -970,13 +411,10 @@ async fn run_managed_launch_worker(app: AppHandle) {
                         }
                     }
                     Ok(Err(error)) => {
-                        if !error.contains("请先从媒体库选择") {
-                            eprintln!("托管应用背景失败：{error}");
-                        }
-                        let app_for_fail = app.clone();
+                        let worker = Arc::clone(&state);
                         let message = error;
-                        let _ = tauri::async_runtime::spawn_blocking(move || {
-                            mark_payload_generation_failed(&app_for_fail, &message);
+                        let _ = tokio::task::spawn_blocking(move || {
+                            mark_payload_generation_failed(&worker, &message);
                         })
                         .await;
                     }
@@ -984,12 +422,11 @@ async fn run_managed_launch_worker(app: AppHandle) {
                 }
             }
             ManagedTickOutcome::ReleaseStale => {
-                let app_for_release = app.clone();
-                if let Err(error) = tauri::async_runtime::spawn_blocking(move || {
-                    let state = app_for_release.state::<StudioState>();
-                    let mut controller = lock(&state.controller)?;
+                let worker = Arc::clone(&state);
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    let mut controller = lock(&worker.controller)?;
                     controller.release_stale_session()?;
-                    if let Ok(machine) = lock(&state.managed_machine) {
+                    if let Ok(machine) = lock(&worker.managed_machine) {
                         let (phase, message) = machine.watch_status();
                         let _ = controller.set_watch_status(&phase, &message);
                     }
@@ -1005,115 +442,148 @@ async fn run_managed_launch_worker(app: AppHandle) {
         }
 
         if !matches!(outcome, ManagedTickOutcome::Idle) {
-            let state = app.state::<StudioState>();
             let _ = state.refresh_runtime_status();
-            let _ = state.emit_snapshot(&app);
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     }
 }
 
-fn start_managed_launch_worker(app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        run_managed_launch_worker(app).await;
+pub async fn run() {
+    let state = Arc::new(WorkerState::load().expect("加载 Notion worker 状态失败"));
+    if let Ok(mut controller) = lock(&state.controller) {
+        controller.enable_managed_mode();
+        let _ = controller.set_watch_status("idle", UNCONFIGURED_MESSAGE);
+    }
+    let _ = state.refresh_runtime_status();
+
+    let ipc_state = Arc::clone(&state);
+    let watcher_state = Arc::clone(&state);
+    let ipc = tokio::spawn(async move {
+        if let Err(error) = plugin_ipc::serve(Arc::clone(&ipc_state)).await {
+            eprintln!("Background Studio 插件 IPC 失败：{error}");
+            ipc_state.quitting.store(true, Ordering::SeqCst);
+        }
     });
+    let watcher = tokio::spawn(async move {
+        run_managed_launch_worker(watcher_state).await;
+    });
+
+    while !state.quitting.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    ipc.abort();
+    watcher.abort();
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if !plugin::is_plugin_mode() {
-                let _ = open_main_window(&app);
-            }
-        }))
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
-            let plugin_mode = plugin::is_plugin_mode();
-            let state = StudioState::load()
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
-            if let Ok(payload) = state.active_payload() {
-                match lock(&state.controller)
-                    .and_then(|mut controller| controller.reconnect_saved(payload))
-                {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        eprintln!("启动时未恢复背景会话：没有可用的 Notion CDP 运行时。");
-                    }
-                    Err(error) => {
-                        eprintln!("启动时恢复背景会话失败：{error}");
-                    }
-                }
-                let _ = state.refresh_runtime_status();
-            }
-            let settings = lock(&state.settings)
-                .map_err(std::io::Error::other)?
-                .value();
-            if !plugin_mode {
-                host::sync_autostart(
-                    settings.behavior.auto_start_with_windows,
-                    settings.behavior.start_minimized,
-                )
-                .map_err(std::io::Error::other)?;
-            }
-            let start_hidden = plugin_mode
-                || settings.behavior.start_minimized
-                || std::env::args().any(|argument| argument == "--hidden");
-            app.manage(state);
-            if plugin_mode {
-                plugin_ipc::start(app.handle().clone());
-                start_managed_launch_worker(app.handle().clone());
-            } else {
-                let tray = host::setup_tray(app.handle()).map_err(std::io::Error::other)?;
-                let managed = app.state::<StudioState>();
-                *lock(&managed.tray).map_err(std::io::Error::other)? = Some(tray);
-                if let Ok(tray) = lock(&managed.tray) {
-                    if let Some(tray) = tray.as_ref() {
-                        host::update_tray(app.handle(), tray);
-                    }
-                };
-            }
-            if !start_hidden {
-                open_main_window(app.handle()).map_err(std::io::Error::other)?;
-            }
-            start_slideshow_scheduler(app.handle().clone());
-            Ok(())
-        })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                let app = window.app_handle().clone();
-                let state = app.state::<StudioState>();
-                if state.quitting.load(Ordering::SeqCst) {
-                    return;
-                }
-                let close_to_tray = lock(&state.settings)
-                    .map(|settings| settings.value().behavior.close_to_tray)
-                    .unwrap_or(true);
-                if close_to_tray {
-                    let _ = window.hide();
-                } else {
-                    host::quit_without_touching_notion(app);
-                }
-            }
-        })
-        .invoke_handler(tauri::generate_handler![
-            get_snapshot,
-            choose_media_files,
-            choose_media_folder,
-            add_remote_media,
-            refresh_media,
-            remove_media,
-            set_active_media,
-            update_settings,
-            apply_background,
-            pause_background,
-            restore_background,
-            open_data_directory,
-            show_window
-        ])
-        .run(tauri::generate_context!())
-        .expect("运行 Notion Background Studio 失败");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{DisplaySettings, MediaKind};
+    use sha2::{Digest, Sha256};
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+    use uuid::Uuid;
+
+    fn test_state() -> WorkerState {
+        let root = std::env::temp_dir().join(format!("notion-worker-{}", Uuid::new_v4()));
+        WorkerState::load_from(root).expect("load worker")
+    }
+
+    #[test]
+    fn unconfigured_status_does_not_claim_ready() {
+        let state = test_state();
+        let status = state.status_value().unwrap();
+        assert_eq!(status["configured"], false);
+        assert_eq!(status["revision"], Value::Null);
+        assert_eq!(status["message"], UNCONFIGURED_MESSAGE);
+        assert!(state.apply().unwrap_err().contains("尚未配置背景"));
+    }
+
+    #[test]
+    fn unconfigured_watcher_never_takeovers() {
+        assert!(!allows_managed_takeover(false, ManagedAction::Takeover));
+        assert!(!allows_managed_takeover(false, ManagedAction::Attach));
+        assert!(allows_managed_takeover(true, ManagedAction::Takeover));
+        let state = test_state();
+        let outcome = classify_managed_tick(&state).unwrap();
+        assert!(matches!(
+            outcome,
+            ManagedTickOutcome::Idle | ManagedTickOutcome::StatusChanged
+        ));
+        assert_eq!(
+            state.status_value().unwrap()["message"],
+            UNCONFIGURED_MESSAGE
+        );
+    }
+
+    #[test]
+    fn pause_and_shutdown_keep_target_semantics() {
+        let state = test_state();
+        lock(&state.controller).unwrap().enable_managed_mode();
+        let paused = state.pause().unwrap();
+        assert_eq!(paused["paused"], true);
+        assert_eq!(paused["phase"], "paused");
+        let shutdown = state.shutdown();
+        assert_eq!(shutdown["shutdown"], true);
+        assert_eq!(shutdown["keptTarget"], true);
+        assert!(state.quitting.load(Ordering::SeqCst));
+    }
+
+    fn serve_png(body: &[u8]) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = body.to_vec();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&body);
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn configure_stores_revision_and_enables_hot_update_path() {
+        let body = b"worker-png";
+        let digest = format!("{:x}", Sha256::digest(body));
+        let port = serve_png(body);
+        let state = test_state();
+        let params = json!({
+            "schemaVersion": 1,
+            "revision": "rev-hot",
+            "media": {
+                "url": format!("http://127.0.0.1:{port}/media/1"),
+                "kind": "image",
+                "mimeType": "image/png",
+                "sha256": digest,
+                "byteSize": body.len()
+            },
+            "display": DisplaySettings::default()
+        });
+        let status = state.configure(Some(&params)).await.unwrap();
+        assert_eq!(status["configured"], true);
+        assert_eq!(status["revision"], "rev-hot");
+        let payload = state.active_payload().unwrap();
+        assert_eq!(payload.media_bytes.as_ref(), body);
+        assert_eq!(
+            build_active_payload_from_bytes(
+                body.to_vec(),
+                "image/png",
+                &MediaKind::Image,
+                &DisplaySettings::default()
+            )
+            .unwrap()
+            .revision,
+            payload.revision
+        );
+    }
 }

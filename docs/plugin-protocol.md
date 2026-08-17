@@ -1,44 +1,135 @@
 # Background Studio 插件协议
 
-见组织规范：与 Codex 共用 `pluginProtocol: 1`。
+本仓库是纯 Rust 无界面 worker，只由 Background Studio 壳启动。
 
-本插件：
-
-- 启动：`Notion Background Studio.exe --plugin`
+- 启动：`Notion Background Studio.exe`（壳仍会带 `--plugin`，worker 忽略该参数）
 - Pipe：`\\.\pipe\background-studio-notion`
 - `pluginId`：`notion`
+- `pluginProtocol`：`2`
 - Release 产物：`NotionBackgroundStudio-<version>-plugin.zip`
 
-完整协议说明见
-[codex_desktop_background/docs/plugin-protocol.md](https://github.com/background-studio/codex_desktop_background/blob/main/docs/plugin-protocol.md)
-或壳仓文档。
+## 传输
 
-## 插件模式自动接管
+Named Pipe，每行一个 JSON。
 
-协议版本仍是 `pluginProtocol: 1`，命令不变。`--plugin` 启动后会在后台监视官方 Notion，而不会自动打开它。
+请求：
 
-行为：
+```json
+{"id":"...","cmd":"...","params":{}}
+```
 
-- 没有官方进程时等待用户照常启动
-- 插件启动前已经存在的普通进程不会被自动关闭，等待壳通过现有 `apply` 手动重启接管
-- 用户新启动的普通官方进程按完整可执行路径确认后，关闭并以本机调试参数重启，再自动注入上次背景
-- 已有有效调试会话直接重连；带调试参数但端口尚未就绪时等待，不误杀
-- 目标退出后清理失效 engine / runtime，重新等待
-- `pause` / `restore` 立即暂停本次插件进程内的 watcher；`apply` 立即重新武装
-- 带调试参数但端口 45 秒内未就绪时进入错误状态并等待进程退出，不会强杀该进程
-- 已连接会话失联且目标仍在运行时，清掉失效会话并回到手动接管，不会继续显示 active
-- 停用由壳结束插件进程，不改动当前 Notion
+成功：
 
-`status` 的 `message` 例如：
+```json
+{"id":"...","ok":true,"result":{}}
+```
 
-- `已启用，等待 Notion 启动`
-- `Notion 已在运行，点立即接管可重启`
-- `正在接管 Notion`
-- `背景已自动应用`
-- `暂停托管`
-- `调试端口未能在 45 秒内就绪，等待 Notion 退出后重新接管`
-- `请先从媒体库选择一张图片或一个视频。`
+失败：
 
-探测失败时 `phase` 为 `error`；下一次成功探测会恢复到当前等待/已有进程/暂停状态。
+```json
+{"id":"...","ok":false,"error":"..."}
+```
 
-`paused` 在暂停托管或恢复官方外观后为 `true`。
+## 命令
+
+### hello
+
+返回：
+
+```json
+{
+  "pluginProtocol": 2,
+  "pluginId": "notion",
+  "version": "0.2.12-beta.2",
+  "capabilities": {
+    "mediaKinds": ["image", "video"],
+    "managedLaunch": true,
+    "autoTakeover": true,
+    "hotUpdate": true,
+    "blobInject": true,
+    "loopbackMediaOnly": true,
+    "keepsTargetOnShutdown": true,
+    "maxMediaBytes": 67108864,
+    "commands": ["hello", "configure", "status", "apply", "pause", "restore", "shutdown"]
+  }
+}
+```
+
+### configure
+
+```json
+{
+  "schemaVersion": 1,
+  "revision": "配置摘要",
+  "media": {
+    "url": "http://127.0.0.1:<port>/<token>/media/<id>?v=...",
+    "kind": "image",
+    "mimeType": "image/png",
+    "sha256": "64位十六进制",
+    "byteSize": 123
+  },
+  "display": {
+    "fit": "cover",
+    "positionX": 50,
+    "positionY": 50,
+    "opacity": 0.72,
+    "blur": 0,
+    "scale": 1,
+    "overlayColor": "#101416",
+    "overlayOpacity": 0.12,
+    "blockFillOpacity": 0.55,
+    "homeIntensity": 1,
+    "taskIntensity": 0.32,
+    "sidebarOpacity": 0.18,
+    "surfaceOpacity": 0.12,
+    "composerOpacity": 0.88,
+    "menuOpacity": 0.9,
+    "terminalOpacity": 0.9,
+    "enabledOnHome": true,
+    "enabledOnTasks": true,
+    "videoMuted": true,
+    "videoPlaybackRate": 1
+  }
+}
+```
+
+约束：
+
+- URL 只能是 `http://127.0.0.1` 或 `http://localhost`
+- 拒绝 userinfo、非回环、端口 0、超长字段/JSON
+- worker 用 `no_proxy` 拉取媒体，最大 64 MiB
+- 校验 `Content-Length`、实际大小、`sha256`、`mimeType`/`kind`
+- Notion 不能直接读回环 URL，worker 下载 bytes 后走 chunk/Blob 注入
+- 当前已 active 时，新的 configure 会热更新背景
+
+`display` 的字段全部必填，缺字段直接报错，不套默认值。
+
+### apply
+
+使用最近一次有效 configure。允许手动重启接管，并重新武装 watcher。
+
+未配置时返回 `尚未配置背景`。
+
+### status
+
+保留 `phase` / `message` / `activeTargets` / `paused`，并报告 `configured` / `revision`。
+
+未配置时 `message` 为 `尚未配置背景`。
+
+### pause / restore
+
+暂停或恢复官方外观，并暂停本次进程内的自动接管。后续 `apply` 会重新武装。
+
+### shutdown
+
+结束 worker，保留当前 Notion。成功结果为 `{"shutdown":true,"keptTarget":true}`。
+
+## 自动接管
+
+- 未配置时只等待，报告“尚未配置背景”，不关闭、不接管目标
+- 配置完成后才允许 Attach / Takeover
+- 插件启动前已经在运行的普通进程不会被自动关闭；壳可发 `apply` 手动重启接管
+- 已有有效调试会话直接重连
+- 目标退出后清理失效 session，重新等待
+- `pause` / `restore` 暂停 watcher；`apply` 重新武装
+- 停用由壳结束 worker，不改动当前 Notion

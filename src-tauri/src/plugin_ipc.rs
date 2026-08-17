@@ -1,76 +1,62 @@
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tauri::{AppHandle, Manager};
+use std::sync::Arc;
+
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::{
-    host, lock,
-    plugin::{self, PIPE_NAME, PLUGIN_ID, PLUGIN_PROTOCOL},
-    StudioState,
+    plugin::runtime_pipe_name,
+    protocol::{hello_result, parse_request, PluginRequest},
+    WorkerState,
 };
 
-#[derive(Debug, Deserialize)]
-struct PluginRequest {
-    id: String,
-    cmd: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StatusResult {
-    plugin_protocol: u32,
-    plugin_id: &'static str,
-    version: &'static str,
-    phase: String,
-    message: String,
-    active_targets: u32,
-    paused: bool,
-}
-
-pub fn start(app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = serve(app).await {
-            eprintln!("Background Studio 插件 IPC 失败：{error}");
-        }
-    });
+pub async fn serve(state: Arc<WorkerState>) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        serve_windows(state).await
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        Err("插件 IPC 仅支持 Windows。".to_string())
+    }
 }
 
 #[cfg(windows)]
-async fn serve(app: AppHandle) -> Result<(), String> {
+async fn serve_windows(state: Arc<WorkerState>) -> Result<(), String> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
+    let pipe_name = runtime_pipe_name()?;
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
-        .create(PIPE_NAME)
+        .create(&pipe_name)
         .map_err(|error| format!("创建插件管道失败：{error}"))?;
 
     loop {
+        if state.quitting.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
         server
             .connect()
             .await
             .map_err(|error| format!("等待插件管道连接失败：{error}"))?;
         let connected = server;
         server = ServerOptions::new()
-            .create(PIPE_NAME)
+            .create(&pipe_name)
             .map_err(|error| format!("重建插件管道失败：{error}"))?;
 
-        let app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) = handle_client(app, connected).await {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(error) = handle_client(state, connected).await {
                 eprintln!("插件 IPC 会话结束：{error}");
             }
         });
     }
-}
-
-#[cfg(not(windows))]
-async fn serve(_app: AppHandle) -> Result<(), String> {
-    Err("插件 IPC 仅支持 Windows。".to_string())
+    Ok(())
 }
 
 #[cfg(windows)]
 async fn handle_client(
-    app: AppHandle,
+    state: Arc<WorkerState>,
     client: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 ) -> Result<(), String> {
     let (reader, mut writer) = tokio::io::split(client);
@@ -80,12 +66,12 @@ async fn handle_client(
         if line.is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<PluginRequest>(&line) {
-            Ok(request) => dispatch(&app, request).await,
+        let response = match parse_request(&line) {
+            Ok(request) => dispatch(Arc::clone(&state), request).await,
             Err(error) => json!({
                 "id": "",
                 "ok": false,
-                "error": format!("无效请求：{error}")
+                "error": error
             }),
         };
         let mut payload = serde_json::to_string(&response).map_err(|error| error.to_string())?;
@@ -95,24 +81,41 @@ async fn handle_client(
             .await
             .map_err(|error| error.to_string())?;
         writer.flush().await.map_err(|error| error.to_string())?;
+        if state.quitting.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
     }
     Ok(())
 }
 
-async fn dispatch(app: &AppHandle, request: PluginRequest) -> serde_json::Value {
+pub async fn dispatch(state: Arc<WorkerState>, request: PluginRequest) -> Value {
     let id = request.id.clone();
     let result = match request.cmd.as_str() {
-        "status" => status_payload(app),
-        "open-ui" => crate::open_main_window(app)
-            .map(|_| json!({ "opened": true }))
-            .map_err(|error| error),
-        "apply" => apply_via_ipc(app.clone()).await,
-        "pause" => pause_via_ipc(app.clone()).await,
-        "restore" => restore_via_ipc(app.clone()).await,
-        "quit-keep-target" => {
-            host::quit_without_touching_notion(app.clone());
-            Ok(json!({ "quitting": true }))
+        "hello" => Ok(hello_result()),
+        "configure" => state.configure(request.params.as_ref()).await,
+        "status" => state.status_value(),
+        "apply" => {
+            let state = Arc::clone(&state);
+            match tokio::task::spawn_blocking(move || state.apply()).await {
+                Ok(result) => result,
+                Err(error) => Err(error.to_string()),
+            }
         }
+        "pause" => {
+            let state = Arc::clone(&state);
+            match tokio::task::spawn_blocking(move || state.pause()).await {
+                Ok(result) => result,
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        "restore" => {
+            let state = Arc::clone(&state);
+            match tokio::task::spawn_blocking(move || state.restore()).await {
+                Ok(result) => result,
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        "shutdown" => Ok(state.shutdown()),
         other => Err(format!("未知命令：{other}")),
     };
     match result {
@@ -121,76 +124,134 @@ async fn dispatch(app: &AppHandle, request: PluginRequest) -> serde_json::Value 
     }
 }
 
-fn status_payload(app: &AppHandle) -> Result<serde_json::Value, String> {
-    let state = app.state::<StudioState>();
-    let status = state.runtime_status()?;
-    let payload = StatusResult {
-        plugin_protocol: PLUGIN_PROTOCOL,
-        plugin_id: PLUGIN_ID,
-        version: env!("CARGO_PKG_VERSION"),
-        phase: status.phase.clone(),
-        message: status.message,
-        active_targets: status.active_targets,
-        paused: status.phase == "paused",
-    };
-    serde_json::to_value(payload).map_err(|error| error.to_string())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::WorkerState;
+    use serde_json::json;
+    use uuid::Uuid;
 
-async fn apply_via_ipc(app: AppHandle) -> Result<serde_json::Value, String> {
-    let state = app.state::<StudioState>();
-    let payload = tauri::async_runtime::spawn_blocking({
-        let app = app.clone();
-        move || app.state::<StudioState>().active_payload()
-    })
-    .await
-    .map_err(|error| error.to_string())??;
-    let controller = std::sync::Arc::clone(&state.controller);
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut controller = lock(&controller)?;
-        match controller.apply(payload.clone(), false) {
-            Ok(_) => Ok(()),
-            Err(error) if error.contains("需要重启一次") => {
-                controller.apply(payload, true).map(|_| ())
-            }
-            Err(error) => Err(error),
-        }
-    })
-    .await
-    .map_err(|error| error.to_string())??;
-    let _ = crate::rearm_managed_machine(&state);
-    let _ = state.refresh_runtime_status();
-    status_payload(&app)
-}
+    fn test_state() -> Arc<WorkerState> {
+        let root = std::env::temp_dir().join(format!("notion-ipc-{}", Uuid::new_v4()));
+        Arc::new(WorkerState::load_from(root).unwrap())
+    }
 
-async fn pause_via_ipc(app: AppHandle) -> Result<serde_json::Value, String> {
-    let state = app.state::<StudioState>();
-    state
-        .live_apply_generation
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    let controller = std::sync::Arc::clone(&state.controller);
-    tauri::async_runtime::spawn_blocking(move || lock(&controller)?.pause())
-        .await
-        .map_err(|error| error.to_string())??;
-    crate::pause_managed_machine(&state);
-    let _ = state.refresh_runtime_status();
-    status_payload(&app)
-}
+    #[tokio::test]
+    async fn hello_and_status_and_unknown_commands() {
+        let state = test_state();
+        let hello = dispatch(
+            Arc::clone(&state),
+            PluginRequest {
+                id: "1".to_string(),
+                cmd: "hello".to_string(),
+                params: None,
+            },
+        )
+        .await;
+        assert_eq!(hello["ok"], true);
+        assert_eq!(hello["result"]["pluginProtocol"], 2);
+        assert_eq!(hello["result"]["pluginId"], "notion");
+        assert!(hello["result"]["capabilities"]["blobInject"]
+            .as_bool()
+            .unwrap());
 
-async fn restore_via_ipc(app: AppHandle) -> Result<serde_json::Value, String> {
-    let state = app.state::<StudioState>();
-    state
-        .live_apply_generation
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    let controller = std::sync::Arc::clone(&state.controller);
-    tauri::async_runtime::spawn_blocking(move || lock(&controller)?.restore())
-        .await
-        .map_err(|error| error.to_string())??;
-    crate::pause_managed_machine(&state);
-    let _ = state.refresh_runtime_status();
-    status_payload(&app)
-}
+        let status = dispatch(
+            Arc::clone(&state),
+            PluginRequest {
+                id: "2".to_string(),
+                cmd: "status".to_string(),
+                params: None,
+            },
+        )
+        .await;
+        assert_eq!(status["result"]["configured"], false);
+        assert_eq!(status["result"]["message"], "尚未配置背景");
 
-#[allow(dead_code)]
-pub fn plugin_mode_enabled() -> bool {
-    plugin::is_plugin_mode()
+        let unknown = dispatch(
+            Arc::clone(&state),
+            PluginRequest {
+                id: "3".to_string(),
+                cmd: "open-ui".to_string(),
+                params: None,
+            },
+        )
+        .await;
+        assert_eq!(unknown["ok"], false);
+        assert!(unknown["error"].as_str().unwrap().contains("未知命令"));
+    }
+
+    #[tokio::test]
+    async fn pause_restore_and_shutdown() {
+        let state = test_state();
+        let pause = dispatch(
+            Arc::clone(&state),
+            PluginRequest {
+                id: "7".to_string(),
+                cmd: "pause".to_string(),
+                params: None,
+            },
+        )
+        .await;
+        assert_eq!(pause["ok"], true);
+        assert_eq!(pause["result"]["paused"], true);
+
+        let restore_request = parse_request(r#"{"id":"8","cmd":"restore"}"#).unwrap();
+        assert_eq!(restore_request.cmd, "restore");
+
+        let apply = dispatch(
+            Arc::clone(&state),
+            PluginRequest {
+                id: "4".to_string(),
+                cmd: "apply".to_string(),
+                params: None,
+            },
+        )
+        .await;
+        assert_eq!(apply["ok"], false);
+        assert!(apply["error"].as_str().unwrap().contains("尚未配置背景"));
+
+        let shutdown = dispatch(
+            Arc::clone(&state),
+            PluginRequest {
+                id: "5".to_string(),
+                cmd: "shutdown".to_string(),
+                params: None,
+            },
+        )
+        .await;
+        assert_eq!(shutdown["ok"], true);
+        assert_eq!(shutdown["result"]["shutdown"], true);
+        assert_eq!(shutdown["result"]["keptTarget"], true);
+        assert!(state.quitting.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn configure_rejects_non_loopback_without_fetch() {
+        let state = test_state();
+        let response = dispatch(
+            state,
+            PluginRequest {
+                id: "6".to_string(),
+                cmd: "configure".to_string(),
+                params: Some(json!({
+                    "schemaVersion": 1,
+                    "revision": "bad",
+                    "media": {
+                        "url": "http://example.com/a.png",
+                        "kind": "image",
+                        "mimeType": "image/png",
+                        "sha256": "a".repeat(64),
+                        "byteSize": 8
+                    },
+                    "display": crate::models::DisplaySettings::default()
+                })),
+            },
+        )
+        .await;
+        assert_eq!(response["ok"], false);
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("127.0.0.1 或 localhost"));
+    }
 }
