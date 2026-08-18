@@ -1,6 +1,6 @@
 [package]
 name = "notion-background-studio"
-version = "0.2.12-beta.2"
+version = "0.3.0"
 description = "A headless Background Studio worker for the Notion Windows desktop app."
 authors = ["Notion Background Studio contributors"]
 license = "MIT"

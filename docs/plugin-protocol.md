@@ -40,7 +40,7 @@ Named Pipe，每行一个 JSON。
 {
   "pluginProtocol": 2,
   "pluginId": "notion",
-  "version": "0.2.12-beta.2",
+  "version": "0.3.0",
   "capabilities": {
     "mediaKinds": ["image", "video"],
     "managedLaunch": true,

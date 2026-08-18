@@ -583,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "notion-background-studio"
-version = "0.2.12-beta.2"
+version = "0.3.0"
 dependencies = [
  "base64",
  "chrono",
