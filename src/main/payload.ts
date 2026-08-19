@@ -319,6 +319,42 @@ html.notion-background-active .notion-overlay-container .notion-dropdown-menu {
   box-shadow: none !important;
 }
 
+/*
+ * 设置弹窗（.notion-space-settings）：全屏底罩直接重绘壁纸，盖住背后页面正文，
+ * 否则弹窗一透明就和底下页面文字叠在一起。亮度对齐主图层：
+ * 表面色雾 (1 - opacity * route) + 用户底色层。视频背景时 background-image
+ * 加载失败，自然回落为表面色实底（等同原生观感）。
+ */
+html.notion-background-active .notion-space-settings .notion-modal-underlay {
+  background-color: var(--cbg-surface-color, #191919) !important;
+  background-image:
+    linear-gradient(
+      color-mix(in srgb, var(--cbg-overlay-color) calc(var(--cbg-overlay-opacity) * 100%), transparent),
+      color-mix(in srgb, var(--cbg-overlay-color) calc(var(--cbg-overlay-opacity) * 100%), transparent)
+    ),
+    linear-gradient(
+      color-mix(in srgb, var(--cbg-surface-color, #191919) calc((1 - var(--cbg-opacity) * var(--cbg-route-intensity)) * 100%), transparent),
+      color-mix(in srgb, var(--cbg-surface-color, #191919) calc((1 - var(--cbg-opacity) * var(--cbg-route-intensity)) * 100%), transparent)
+    ),
+    var(--cbg-media-url) !important;
+  background-size: cover, cover, var(--cbg-bg-size) !important;
+  background-position: center, center, var(--cbg-position-x) var(--cbg-position-y) !important;
+  background-repeat: no-repeat !important;
+  filter: blur(var(--cbg-blur));
+}
+html.notion-background-active.notion-background-fit-tile .notion-space-settings .notion-modal-underlay {
+  background-repeat: no-repeat, no-repeat, repeat !important;
+}
+/* 设置弹窗内的两块实底：左侧导航（--c-bacSec）、右侧内容区（--c-bacPri）。
+ * 清成透明，让外层 [role="dialog"] 的菜单雾统一打底，避免双层叠加变暗。
+ * 左栏子树里还有嵌套的 --c-bacSec 实底（如底部「购买 Notion AI」sticky 栏），一并清掉。 */
+html.notion-background-active .notion-space-settings [role="dialog"] > [role="presentation"] > div[style*="--c-bacSec"],
+html.notion-background-active .notion-space-settings [role="dialog"] > [role="presentation"] > div[style*="--c-bacSec"] [style*="--c-bacSec"],
+html.notion-background-active .notion-space-settings [role="dialog"] [role="tabpanel"] > div[style*="--c-bacPri"] {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
 /* tab-chrome-align-v2: Windows outerHeight includes OS frame; do not use outer-inner as tab shift. */
 /* hover-install-v3: ignore descendant hover class churn; avoid wallpaper jitter. */
 html.notion-background-dark #notion-background-layer {
@@ -369,7 +405,8 @@ export function buildRendererPayload(input: PayloadInput) {
       "--cbg-overlay-opacity", "--cbg-home-intensity", "--cbg-task-intensity",
       "--cbg-route-intensity", "--cbg-sidebar-opacity", "--cbg-surface-opacity",
       "--cbg-composer-opacity", "--cbg-menu-opacity", "--cbg-terminal-opacity",
-      "--cbg-block-fill-opacity", "--cbg-media-url", "--cbg-surface-color"
+      "--cbg-block-fill-opacity", "--cbg-media-url", "--cbg-surface-color",
+      "--cbg-bg-size"
     ];
 
     const previous = window[STATE];
@@ -694,6 +731,11 @@ export function buildRendererPayload(input: PayloadInput) {
       setProp("--cbg-blur", config.display.blur + "px");
       setProp("--cbg-scale", String(config.display.scale));
       setProp("--cbg-fit", config.display.fit === "tile" ? "cover" : config.display.fit);
+      // background-size 不接受 fill/tile，需单独映射（设置弹窗底罩重绘壁纸用）。
+      setProp("--cbg-bg-size",
+        config.display.fit === "fill" ? "100% 100%"
+        : config.display.fit === "tile" ? "auto"
+        : config.display.fit);
       setProp("--cbg-position-x", config.display.positionX + "%");
       setProp("--cbg-position-y", config.display.positionY + "%");
       setProp("--cbg-overlay-color", config.display.overlayColor);

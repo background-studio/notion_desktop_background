@@ -114,6 +114,24 @@ Notion class 名和 StyleX hash 可能随版本变化。这里记录的是稳定
 - `.notion-dropdown-menu`
 - 透明度：`--cbg-menu-opacity`（菜单用 `* 100%`，需要时可单独收紧）
 
+### 设置弹窗
+
+- 稳定入口：`.notion-space-settings`（overlay 容器内的全屏 fixed 包装层）。
+- 外层 `[role="dialog"].notion-dialog`（内联 `background: var(--c-bacEle)`）已被
+  通用弹层规则按 `--cbg-menu-opacity` 打雾，无需另写。
+- 内部两块实底需清透明：左侧导航 `[role="dialog"] > [role="presentation"] >
+  div[style*="--c-bacSec"]`，右侧内容 `[role="tabpanel"] > div[style*="--c-bacPri"]`。
+- 左栏子树里还有嵌套 `--c-bacSec` 实底：底部「购买 Notion AI」是 sticky 栏
+  （`position: sticky; bottom: 0; background-color: var(--c-bacSec)`），
+  用 `div[style*="--c-bacSec"] [style*="--c-bacSec"]` 一并清掉。
+- `.notion-modal-underlay`（内联 `background: var(--ca-modUndBac)`，约 0.8 黑）盖住
+  弹窗背后的壁纸。处理方式不是调透明度，而是在底罩上用 `--cbg-media-url` 重绘壁纸
+  并叠 `(1 - opacity * route)` 表面雾 + 用户底色层，既盖住背后页面正文，又与主图层
+  亮度一致。弹窗透明时看到的是干净壁纸，不会和底下页面文字叠字。
+- `background-size` 不接受 `fill`/`tile`，重绘用单独映射的 `--cbg-bg-size`
+  （fill → `100% 100%`，tile → `auto` + repeat）。
+- 视频背景时 `background-image` 加载失败，底罩自然回落为表面色实底。
+
 ## 路由强度
 
 | Studio 文案 | 设置字段 | 根 class | 用途 |
