@@ -21,6 +21,8 @@ const MEDIA_CHUNK_BYTES: usize = 192 * 1024;
 const PENDING_MEDIA_PARTS_KEY: &str = "__BACKGROUND_STUDIO_PENDING_MEDIA_PARTS__";
 
 const REMOVE_RENDERER_PAYLOAD: &str = r#"(() => {
+  // 推进运行序号：让仍在 decode 路上的注入轮醒来后自杀，避免移除后又装回来。
+  window.__NOTION_BACKGROUND_RUN_SEQ__ = (Number(window.__NOTION_BACKGROUND_RUN_SEQ__) || 0) + 1;
   document.getElementById("notion-background-early-transparency")?.remove();
   const state = window.__NOTION_BACKGROUND_STUDIO__;
   if (state?.cleanup) return state.cleanup();
@@ -837,6 +839,8 @@ mod tests {
         assert!(payload.contains("revision-1"));
         assert!(payload.contains("MutationObserver"));
         assert!(REMOVE_RENDERER_PAYLOAD.contains("cleanup"));
+        // 移除时先推进运行序号，让还在 decode 的注入轮自杀，避免移除后又装回来。
+        assert!(REMOVE_RENDERER_PAYLOAD.contains("__NOTION_BACKGROUND_RUN_SEQ__"));
     }
 
     #[test]

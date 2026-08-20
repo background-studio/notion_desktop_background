@@ -171,6 +171,11 @@ mod tests {
             .contains("style.dataset.cbgRevision = config.revision"));
         assert!(payload.script.contains("Promise.race"));
         assert!(payload.script.contains("background media decode timeout"));
+        // 并发轮次护栏：decode 醒来后与 install 回调里都要核对运行序号，
+        // 清理必须读当下的 window[STATE]，否则孤儿定时器会造成双图闪烁。
+        assert!(payload.script.contains("__NOTION_BACKGROUND_RUN_SEQ__"));
+        assert!(payload.script.contains("if (superseded()) return false;"));
+        assert!(payload.script.contains("const previous = window[STATE];"));
         assert!(payload.script.contains("img:not(.notion-emoji)"));
         assert!(payload.script.contains("border-color: color-mix"));
         assert!(payload.script.contains("resolveTabChromeHeight"));

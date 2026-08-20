@@ -174,6 +174,23 @@ transparent` 也没有跟着滑杆走。
 处理：色块底、边框颜色走同一套 `--cbg-block-fill-opacity`，并去掉残留
 `box-shadow`，让整张卡片一起淡。
 
+### 过夜后背景在两张图之间来回闪
+
+原因：payload 在 `await decode` **之前**抓取 `previous = window[STATE]` 快照。
+页面被 Chromium 冻结（过夜/后台）时 decode 卡住，Rust 侧 evaluate 超时把
+会话标坏并重连重发，于是多份注入脚本并发执行且抓到同一个旧快照。先醒的
+装好并覆盖 `window[STATE]`；后醒的清理的还是旧快照，清不到前一份的
+observer 和 4s 定时器——留下「孤儿安装器」每 4s 把背景改回自己那张图，
+和最新一轮互抢 `#notion-background-media` 的 src，即双图闪烁。孤儿还会把
+`style.dataset.cbgRevision` 改回旧值，插件以为没装上，每 1.2s 整包重灌，
+孤儿越积越多。
+
+处理：全局自增 `__NOTION_BACKGROUND_RUN_SEQ__` 运行序号。每轮开头领号；
+decode 醒来后核对，已有更新轮次则撤销自己的 Blob 并放弃（不碰画面）；
+`install()` 开头同样核对，遗留回调一律 no-op；清理改为读**当下**的
+`window[STATE]` 而非进门快照；`REMOVE_RENDERER_PAYLOAD` 先推进序号再清理，
+避免移除后在途轮次又把背景装回来。
+
 ### 换图后只有标题栏更新，正文要切页面才变
 
 原因：Notion 会留一个 0×0 的 `/blank` 恢复页。那页上 `img.decode()` 即使图片

@@ -409,7 +409,12 @@ export function buildRendererPayload(input: PayloadInput) {
       "--cbg-bg-size"
     ];
 
-    const previous = window[STATE];
+    // 运行序号：冻结页恢复时，超时重发会让多份注入脚本并发执行。旧一轮在任何
+    // await 之后、以及 install 回调里都必须核对序号并自杀，否则新旧两轮的
+    // 定时器会互相把背景改回自己的图，表现为两张背景来回闪烁。
+    const RUN_SEQ = "__NOTION_BACKGROUND_RUN_SEQ__";
+    const runToken = (window[RUN_SEQ] = (Number(window[RUN_SEQ]) || 0) + 1);
+    const superseded = () => window[RUN_SEQ] !== runToken;
     let scheduled = null;
     let scheduledRaf = null;
     let shadowPatch = null;
@@ -451,6 +456,16 @@ export function buildRendererPayload(input: PayloadInput) {
       }
     }
 
+    // decode 是本轮唯一的 await；醒来后若已有更新一轮开始，放弃本轮，
+    // 不碰画面（旧图保持可见，由最新一轮做原子替换）。
+    if (superseded()) {
+      if (String(blobUrl).startsWith("blob:")) URL.revokeObjectURL(blobUrl);
+      return { installed: false, superseded: true, revision: config.revision };
+    }
+
+    // 清理必须读当下的 window[STATE]，不能用进门时抓的快照：并发轮次下快照
+    // 会指向同一个旧状态，第二轮清不到第一轮的 observer/timer，留下孤儿安装器。
+    const previous = window[STATE];
     if (previous?.cleanup) {
       previous.cleanup();
     } else {
@@ -644,6 +659,8 @@ export function buildRendererPayload(input: PayloadInput) {
     };
 
     const install = (opts = {}) => {
+      // 本轮已被更新一轮取代时，observer/timer 的遗留回调不得再碰画面。
+      if (superseded()) return false;
       const heavy = opts.heavy !== false;
       const root = document.documentElement;
       if (!root) return false;
@@ -830,6 +847,8 @@ export function buildRendererPayload(input: PayloadInput) {
 }
 
 export const REMOVE_RENDERER_PAYLOAD = String.raw`(() => {
+  // 推进运行序号：让仍在 decode 路上的注入轮醒来后自杀，避免移除后又装回来。
+  window.__NOTION_BACKGROUND_RUN_SEQ__ = (Number(window.__NOTION_BACKGROUND_RUN_SEQ__) || 0) + 1;
   const state = window.__NOTION_BACKGROUND_STUDIO__;
   if (state?.cleanup) return state.cleanup();
   document.getElementById("notion-background-layer")?.remove();
