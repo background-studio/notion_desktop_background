@@ -10,3 +10,4 @@ tools/
 poc/
 build/
 
+.bce-tool/
