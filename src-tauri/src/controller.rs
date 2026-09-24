@@ -18,7 +18,7 @@ use crate::{
     injector::{probe_browser_identity, read_browser_identity, InjectorEngine},
     managed_launch::{
         debug_ports_from_records, has_remote_debugging_arg, now_ms, snapshot_matching_executable,
-        ManagedObservation, ProcessKey,
+        ManagedObservation, ProcessKey, ProcessTracker,
     },
     models::RuntimeStatus,
     payload::ActivePayload,
@@ -337,6 +337,7 @@ pub struct NotionController {
     state: Option<RuntimeState>,
     status: RuntimeStatus,
     install_cache: Option<(Instant, NotionInstall)>,
+    tracker: ProcessTracker,
     managed_mode: bool,
     managed_paused: bool,
     rearm_requested: bool,
@@ -355,6 +356,7 @@ impl NotionController {
             state,
             status: RuntimeStatus::default(),
             install_cache: None,
+            tracker: ProcessTracker::new(),
             managed_mode: false,
             managed_paused: false,
             rearm_requested: false,
@@ -466,7 +468,7 @@ impl NotionController {
 
     pub fn probe_target(&mut self) -> Result<TargetProbe, String> {
         let install = self.discover_cached()?;
-        let records = snapshot_matching_executable(&install.executable)?;
+        let records = self.tracker.scan(&install.executable)?;
         let processes = records.iter().map(|record| record.key).collect();
         let has_debug_launch = records.iter().any(|record| {
             record
@@ -479,9 +481,10 @@ impl NotionController {
         if self.engine.is_some() && !live_saved {
             self.drop_dead_engine();
         }
-        let live_from_ports = debug_ports_from_records(&records)
-            .into_iter()
-            .any(|port| probe_browser_identity(port).is_ok());
+        let live_from_ports = !live_saved
+            && debug_ports_from_records(&records)
+                .into_iter()
+                .any(|port| probe_browser_identity(port).is_ok());
         Ok(TargetProbe {
             processes,
             has_live_debug_session: live_saved || live_from_ports,

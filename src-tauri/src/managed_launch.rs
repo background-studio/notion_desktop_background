@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProcessKey {
@@ -448,8 +448,253 @@ pub fn snapshot_matching_executable(_executable: &str) -> Result<Vec<ProcessReco
     Err("进程快照仅支持 Windows。".to_string())
 }
 
+fn target_names(executable: &str) -> (String, String) {
+    let target = normalize_executable_path(executable);
+    let file_name = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Notion.exe")
+        .to_ascii_lowercase();
+    (target, file_name)
+}
+
+pub enum Probe {
+    Match(ProcessRecord),
+    /// Another program, or one this worker may not open at all (system services, other
+    /// users); access rights do not change while a process lives.
+    Other,
+    /// Opened but not readable right now, e.g. while exiting; asked again next scan.
+    Unavailable,
+}
+
+pub trait ProcessSource {
+    fn process_ids(&self) -> Result<Vec<u32>, String>;
+    /// Every running process with a flag telling whether its file name matches.
+    fn named_processes(&self, file_name: &str) -> Result<Vec<(u32, bool)>, String>;
+    fn probe(&self, pid: u32, target: &str) -> Probe;
+    /// The same checks a snapshot applies (image path readable and equal to `target`, same
+    /// creation time), so exiting processes drop out exactly when they would there.
+    fn still_matches(&self, pid: u32, target: &str, created_at: u64) -> bool;
+    fn command_line(&self, pid: u32) -> Option<String>;
+}
+
+pub struct SystemProcesses;
+
+/// A PID recycled between two incremental scans is only noticed by a full scan.
+const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Follows the processes of one executable across the watcher's 800 ms ticks. A full
+/// Toolhelp snapshot costs ~10 ms on a machine with ~500 processes, so between full scans
+/// only PIDs that appeared since the previous scan are opened, known matches are
+/// re-validated by creation time, and command lines are read once per process.
+pub struct ProcessTracker {
+    target: String,
+    known: HashMap<u32, Option<ProcessRecord>>,
+    last_full_scan: Option<Instant>,
+}
+
+impl Default for ProcessTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProcessTracker {
+    pub fn new() -> Self {
+        Self {
+            target: String::new(),
+            known: HashMap::new(),
+            last_full_scan: None,
+        }
+    }
+
+    /// Same records as [`snapshot_matching_executable`], sorted by PID.
+    pub fn scan(&mut self, executable: &str) -> Result<Vec<ProcessRecord>, String> {
+        self.scan_with(&SystemProcesses, executable, Instant::now())
+    }
+
+    pub fn scan_with(
+        &mut self,
+        source: &impl ProcessSource,
+        executable: &str,
+        now: Instant,
+    ) -> Result<Vec<ProcessRecord>, String> {
+        let (target, file_name) = target_names(executable);
+        if target != self.target {
+            self.known.clear();
+            self.last_full_scan = None;
+            self.target = target;
+        }
+        let full_scan_due = self.last_full_scan.map_or(true, |last| {
+            now.saturating_duration_since(last) >= FULL_SCAN_INTERVAL
+        });
+        if full_scan_due {
+            self.full_scan(source, &file_name)?;
+            self.last_full_scan = Some(now);
+        } else {
+            self.incremental_scan(source)?;
+        }
+        let mut records = Vec::new();
+        for (pid, record) in &mut self.known {
+            if let Some(record) = record {
+                if record.command_line.is_none() {
+                    record.command_line = source.command_line(*pid);
+                }
+                records.push(record.clone());
+            }
+        }
+        records.sort_by_key(|record| record.key.pid);
+        Ok(records)
+    }
+
+    fn full_scan(&mut self, source: &impl ProcessSource, file_name: &str) -> Result<(), String> {
+        let processes = source.named_processes(file_name)?;
+        let mut previous = std::mem::take(&mut self.known);
+        for (pid, named) in processes {
+            if !named {
+                self.known.insert(pid, None);
+                continue;
+            }
+            if let Some(Some(record)) = previous.remove(&pid) {
+                if source.still_matches(pid, &self.target, record.key.created_at) {
+                    self.known.insert(pid, Some(record));
+                    continue;
+                }
+            }
+            self.probe_into(source, pid);
+        }
+        Ok(())
+    }
+
+    fn incremental_scan(&mut self, source: &impl ProcessSource) -> Result<(), String> {
+        let ids = source.process_ids()?;
+        let live: HashSet<u32> = ids.iter().copied().collect();
+        let target = &self.target;
+        self.known.retain(|pid, record| {
+            live.contains(pid)
+                && record.as_ref().map_or(true, |record| {
+                    source.still_matches(*pid, target, record.key.created_at)
+                })
+        });
+        for pid in ids {
+            if !self.known.contains_key(&pid) {
+                self.probe_into(source, pid);
+            }
+        }
+        Ok(())
+    }
+
+    fn probe_into(&mut self, source: &impl ProcessSource, pid: u32) {
+        match source.probe(pid, &self.target) {
+            Probe::Match(record) => {
+                self.known.insert(pid, Some(record));
+            }
+            Probe::Other => {
+                self.known.insert(pid, None);
+            }
+            Probe::Unavailable => {}
+        }
+    }
+}
+
+#[cfg(windows)]
+impl ProcessSource for SystemProcesses {
+    fn process_ids(&self) -> Result<Vec<u32>, String> {
+        native::process_ids()
+    }
+
+    fn named_processes(&self, file_name: &str) -> Result<Vec<(u32, bool)>, String> {
+        let mut processes = Vec::new();
+        native::for_each_process(|pid, name| {
+            processes.push((pid, name.eq_ignore_ascii_case(file_name)));
+        })?;
+        Ok(processes)
+    }
+
+    fn probe(&self, pid: u32, target: &str) -> Probe {
+        let Some(handle) = native::open_process(pid) else {
+            return Probe::Other;
+        };
+        let Some(path) = native::image_path(&handle) else {
+            return Probe::Unavailable;
+        };
+        if normalize_executable_path(&path) != target {
+            return Probe::Other;
+        }
+        match native::creation_time(&handle) {
+            Some(created_at) => Probe::Match(ProcessRecord {
+                key: ProcessKey { pid, created_at },
+                command_line: native::command_line(&handle),
+            }),
+            None => Probe::Unavailable,
+        }
+    }
+
+    fn still_matches(&self, pid: u32, target: &str, created_at: u64) -> bool {
+        let Some(handle) = native::open_process(pid) else {
+            return false;
+        };
+        native::image_path(&handle).is_some_and(|path| normalize_executable_path(&path) == target)
+            && native::creation_time(&handle) == Some(created_at)
+    }
+
+    fn command_line(&self, pid: u32) -> Option<String> {
+        native::command_line(&native::open_process(pid)?)
+    }
+}
+
+#[cfg(not(windows))]
+impl ProcessSource for SystemProcesses {
+    fn process_ids(&self) -> Result<Vec<u32>, String> {
+        Err("进程快照仅支持 Windows。".to_string())
+    }
+
+    fn named_processes(&self, _file_name: &str) -> Result<Vec<(u32, bool)>, String> {
+        Err("进程快照仅支持 Windows。".to_string())
+    }
+
+    fn probe(&self, _pid: u32, _target: &str) -> Probe {
+        Probe::Unavailable
+    }
+
+    fn still_matches(&self, _pid: u32, _target: &str, _created_at: u64) -> bool {
+        false
+    }
+
+    fn command_line(&self, _pid: u32) -> Option<String> {
+        None
+    }
+}
+
 #[cfg(windows)]
 fn snapshot_matching_executable_windows(executable: &str) -> Result<Vec<ProcessRecord>, String> {
+    let (target, file_name) = target_names(executable);
+    let mut records = Vec::new();
+    native::for_each_process(|pid, name| {
+        if !name.eq_ignore_ascii_case(&file_name) {
+            return;
+        }
+        let Some(handle) = native::open_process(pid) else {
+            return;
+        };
+        let Some(path) = native::image_path(&handle) else {
+            return;
+        };
+        if normalize_executable_path(&path) != target {
+            return;
+        }
+        if let Some(created_at) = native::creation_time(&handle) {
+            records.push(ProcessRecord {
+                key: ProcessKey { pid, created_at },
+                command_line: native::command_line(&handle),
+            });
+        }
+    })?;
+    Ok(records)
+}
+
+#[cfg(windows)]
+mod native {
     use std::mem::{size_of, zeroed};
 
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
@@ -457,11 +702,12 @@ fn snapshot_matching_executable_windows(executable: &str) -> Result<Vec<ProcessR
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
+    use windows_sys::Win32::System::ProcessStatus::K32EnumProcesses;
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
-    struct SafeHandle(HANDLE);
+    pub struct SafeHandle(HANDLE);
 
     impl SafeHandle {
         fn new(handle: HANDLE) -> Option<Self> {
@@ -499,8 +745,86 @@ fn snapshot_matching_executable_windows(executable: &str) -> Result<Vec<ProcessR
         ) -> i32;
     }
 
-    fn query_command_line(handle: HANDLE) -> Option<String> {
+    pub fn open_process(pid: u32) -> Option<SafeHandle> {
+        if pid == 0 {
+            return None;
+        }
+        SafeHandle::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })
+    }
+
+    pub fn image_path(handle: &SafeHandle) -> Option<String> {
+        let mut image = [0u16; 1024];
+        let mut size = image.len() as u32;
+        if unsafe { QueryFullProcessImageNameW(handle.0, 0, image.as_mut_ptr(), &mut size) } == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&image[..size as usize]))
+    }
+
+    pub fn creation_time(handle: &SafeHandle) -> Option<u64> {
+        let mut creation = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut exit_time = creation;
+        let mut kernel = creation;
+        let mut user = creation;
+        if unsafe {
+            GetProcessTimes(
+                handle.0,
+                &mut creation,
+                &mut exit_time,
+                &mut kernel,
+                &mut user,
+            )
+        } == 0
+        {
+            return None;
+        }
+        Some((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+    }
+
+    pub fn for_each_process(mut visit: impl FnMut(u32, &str)) -> Result<(), String> {
+        let snapshot = SafeHandle::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })
+            .ok_or_else(|| "无法创建进程快照。".to_string())?;
+        let mut entry = unsafe { zeroed::<PROCESSENTRY32W>() };
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut has_entry = unsafe { Process32FirstW(snapshot.0, &mut entry) } != 0;
+        while has_entry {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(entry.szExeFile.len());
+            visit(
+                entry.th32ProcessID,
+                &String::from_utf16_lossy(&entry.szExeFile[..end]),
+            );
+            has_entry = unsafe { Process32NextW(snapshot.0, &mut entry) } != 0;
+        }
+        Ok(())
+    }
+
+    pub fn process_ids() -> Result<Vec<u32>, String> {
+        let mut ids = vec![0u32; 1024];
+        loop {
+            let capacity = (ids.len() * size_of::<u32>()) as u32;
+            let mut written = 0u32;
+            if unsafe { K32EnumProcesses(ids.as_mut_ptr(), capacity, &mut written) } == 0 {
+                return Err("无法枚举进程。".to_string());
+            }
+            // A completely filled buffer may have been truncated.
+            if written < capacity {
+                ids.truncate(written as usize / size_of::<u32>());
+                return Ok(ids);
+            }
+            ids.resize(ids.len() * 2, 0);
+        }
+    }
+
+    pub fn command_line(handle: &SafeHandle) -> Option<String> {
         const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+        let handle = handle.0;
         unsafe {
             let mut buffer = vec![0u8; 4096];
             let mut return_length = 0u32;
@@ -545,84 +869,6 @@ fn snapshot_matching_executable_windows(executable: &str) -> Result<Vec<ProcessR
                 chars,
             )))
         }
-    }
-
-    fn query_record(pid: u32, target: &str) -> Option<ProcessRecord> {
-        if pid == 0 {
-            return None;
-        }
-        unsafe {
-            let handle = SafeHandle::new(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid))?;
-            let mut image = [0u16; 1024];
-            let mut size = image.len() as u32;
-            if QueryFullProcessImageNameW(handle.0, 0, image.as_mut_ptr(), &mut size) == 0 {
-                return None;
-            }
-            let path = String::from_utf16_lossy(&image[..size as usize]);
-            if normalize_executable_path(&path) != target {
-                return None;
-            }
-            let mut creation = FILETIME {
-                dwLowDateTime: 0,
-                dwHighDateTime: 0,
-            };
-            let mut exit_time = creation;
-            let mut kernel = creation;
-            let mut user = creation;
-            if GetProcessTimes(
-                handle.0,
-                &mut creation,
-                &mut exit_time,
-                &mut kernel,
-                &mut user,
-            ) == 0
-            {
-                return None;
-            }
-            let created_at =
-                (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
-            Some(ProcessRecord {
-                key: ProcessKey { pid, created_at },
-                command_line: query_command_line(handle.0),
-            })
-        }
-    }
-
-    let target = normalize_executable_path(executable);
-    let file_name = Path::new(executable)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Notion.exe")
-        .to_ascii_lowercase();
-
-    unsafe {
-        let snapshot = SafeHandle::new(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0))
-            .ok_or_else(|| "无法创建进程快照。".to_string())?;
-        let mut entry: PROCESSENTRY32W = zeroed();
-        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
-        if Process32FirstW(snapshot.0, &mut entry) == 0 {
-            return Ok(Vec::new());
-        }
-        let mut records = Vec::new();
-        loop {
-            let name = {
-                let end = entry
-                    .szExeFile
-                    .iter()
-                    .position(|unit| *unit == 0)
-                    .unwrap_or(entry.szExeFile.len());
-                String::from_utf16_lossy(&entry.szExeFile[..end]).to_ascii_lowercase()
-            };
-            if name == file_name {
-                if let Some(record) = query_record(entry.th32ProcessID, &target) {
-                    records.push(record);
-                }
-            }
-            if Process32NextW(snapshot.0, &mut entry) == 0 {
-                break;
-            }
-        }
-        Ok(records)
     }
 }
 
@@ -961,5 +1207,270 @@ mod tests {
             normalize_executable_path(r"\\?\C:\Users\Me\AppData\Local\Programs\Notion\Notion.exe"),
             r"c:\users\me\appdata\local\programs\notion\notion.exe"
         );
+    }
+
+    #[derive(Clone)]
+    struct FakeProcess {
+        image: String,
+        created_at: u64,
+        openable: bool,
+        /// Still listed, but its image path can no longer be read.
+        exiting: bool,
+        command_line: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct FakeProcesses {
+        running: std::cell::RefCell<std::collections::BTreeMap<u32, FakeProcess>>,
+        opened: std::cell::Cell<usize>,
+    }
+
+    impl FakeProcesses {
+        fn start(&self, pid: u32, image: &str, created_at: u64) {
+            self.running.borrow_mut().insert(
+                pid,
+                FakeProcess {
+                    image: image.to_string(),
+                    created_at,
+                    openable: true,
+                    exiting: false,
+                    command_line: Some(format!("\"{image}\" --pid={pid}")),
+                },
+            );
+        }
+
+        fn edit(&self, pid: u32, change: impl FnOnce(&mut FakeProcess)) {
+            change(self.running.borrow_mut().get_mut(&pid).unwrap());
+        }
+
+        fn exit(&self, pid: u32) {
+            self.running.borrow_mut().remove(&pid);
+        }
+
+        fn take_opened(&self) -> usize {
+            self.opened.replace(0)
+        }
+
+        fn get(&self, pid: u32) -> Option<FakeProcess> {
+            self.opened.set(self.opened.get() + 1);
+            self.running
+                .borrow()
+                .get(&pid)
+                .filter(|process| process.openable)
+                .cloned()
+        }
+    }
+
+    impl ProcessSource for FakeProcesses {
+        fn process_ids(&self) -> Result<Vec<u32>, String> {
+            Ok(self.running.borrow().keys().copied().collect())
+        }
+
+        fn named_processes(&self, file_name: &str) -> Result<Vec<(u32, bool)>, String> {
+            Ok(self
+                .running
+                .borrow()
+                .iter()
+                .map(|(pid, process)| {
+                    let name = process.image.rsplit('\\').next().unwrap();
+                    (*pid, name.eq_ignore_ascii_case(file_name))
+                })
+                .collect())
+        }
+
+        fn probe(&self, pid: u32, target: &str) -> Probe {
+            let Some(process) = self.get(pid) else {
+                return Probe::Other;
+            };
+            if process.exiting {
+                return Probe::Unavailable;
+            }
+            if normalize_executable_path(&process.image) != target {
+                return Probe::Other;
+            }
+            Probe::Match(ProcessRecord {
+                key: key(pid, process.created_at),
+                command_line: process.command_line,
+            })
+        }
+
+        fn still_matches(&self, pid: u32, target: &str, created_at: u64) -> bool {
+            self.get(pid).is_some_and(|process| {
+                !process.exiting
+                    && normalize_executable_path(&process.image) == target
+                    && process.created_at == created_at
+            })
+        }
+
+        fn command_line(&self, pid: u32) -> Option<String> {
+            self.get(pid).and_then(|process| process.command_line)
+        }
+    }
+
+    const NOTION: &str = r"C:\Users\Me\AppData\Local\Programs\Notion\Notion.exe";
+
+    fn keys_of(records: &[ProcessRecord]) -> Vec<ProcessKey> {
+        records.iter().map(|record| record.key).collect()
+    }
+
+    #[test]
+    fn tracker_opens_only_new_processes_between_full_scans() {
+        let system = FakeProcesses::default();
+        system.start(4, r"C:\Windows\System32\csrss.exe", 1);
+        system.start(100, NOTION, 2);
+        system.start(101, NOTION, 3);
+        system.start(200, r"C:\Portable\Notion.exe", 4);
+        let mut tracker = ProcessTracker::new();
+        let start = Instant::now();
+
+        let records = tracker.scan_with(&system, NOTION, start).unwrap();
+        assert_eq!(keys_of(&records), [key(100, 2), key(101, 3)]);
+        assert_eq!(
+            system.take_opened(),
+            3,
+            "only Notion.exe-named processes are opened"
+        );
+
+        let tick = start + Duration::from_millis(800);
+        assert_eq!(
+            keys_of(&tracker.scan_with(&system, NOTION, tick).unwrap()),
+            [key(100, 2), key(101, 3)]
+        );
+        assert_eq!(
+            system.take_opened(),
+            2,
+            "known matches are only re-validated"
+        );
+
+        system.exit(101);
+        system.start(300, r"C:\Apps\notepad.exe", 5);
+        system.start(301, NOTION, 6);
+        let tick = start + Duration::from_millis(1600);
+        assert_eq!(
+            keys_of(&tracker.scan_with(&system, NOTION, tick).unwrap()),
+            [key(100, 2), key(301, 6)]
+        );
+        assert_eq!(system.take_opened(), 1 + 2);
+    }
+
+    #[test]
+    fn tracker_rereads_missing_command_lines_and_recycled_pids() {
+        let system = FakeProcesses::default();
+        system.start(100, NOTION, 2);
+        system.edit(100, |process| process.command_line = None);
+        let mut tracker = ProcessTracker::new();
+        let start = Instant::now();
+        let records = tracker.scan_with(&system, NOTION, start).unwrap();
+        assert_eq!(records[0].command_line, None);
+
+        system.edit(100, |process| {
+            process.command_line = Some("Notion.exe --remote-debugging-port=9226".to_string())
+        });
+        let tick = start + Duration::from_millis(800);
+        let records = tracker.scan_with(&system, NOTION, tick).unwrap();
+        assert_eq!(debug_ports_from_records(&records), [9226]);
+
+        system.exit(100);
+        system.start(100, NOTION, 7);
+        let tick = start + Duration::from_millis(1600);
+        let records = tracker.scan_with(&system, NOTION, tick).unwrap();
+        assert_eq!(keys_of(&records), [key(100, 7)]);
+        assert!(debug_ports_from_records(&records).is_empty());
+    }
+
+    #[test]
+    fn tracker_caches_inaccessible_processes_until_the_next_full_scan() {
+        let system = FakeProcesses::default();
+        let mut tracker = ProcessTracker::new();
+        let start = Instant::now();
+        tracker.scan_with(&system, NOTION, start).unwrap();
+
+        system.start(4, r"C:\Windows\System32\lsass.exe", 1);
+        system.edit(4, |process| process.openable = false);
+        tracker
+            .scan_with(&system, NOTION, start + Duration::from_millis(800))
+            .unwrap();
+        assert_eq!(system.take_opened(), 1);
+        tracker
+            .scan_with(&system, NOTION, start + Duration::from_millis(1600))
+            .unwrap();
+        assert_eq!(system.take_opened(), 0);
+
+        system.exit(4);
+        system.start(4, NOTION, 9);
+        let tick = start + Duration::from_millis(2400);
+        assert!(tracker.scan_with(&system, NOTION, tick).unwrap().is_empty());
+        let full = start + FULL_SCAN_INTERVAL;
+        assert_eq!(
+            keys_of(&tracker.scan_with(&system, NOTION, full).unwrap()),
+            [key(4, 9)]
+        );
+    }
+
+    #[test]
+    fn tracker_drops_an_exiting_process_like_a_snapshot_does() {
+        let system = FakeProcesses::default();
+        system.start(100, NOTION, 2);
+        system.start(101, NOTION, 3);
+        let mut tracker = ProcessTracker::new();
+        let start = Instant::now();
+        tracker.scan_with(&system, NOTION, start).unwrap();
+
+        system.edit(100, |process| process.exiting = true);
+        let tick = start + Duration::from_millis(800);
+        assert_eq!(
+            keys_of(&tracker.scan_with(&system, NOTION, tick).unwrap()),
+            [key(101, 3)]
+        );
+        let full = start + FULL_SCAN_INTERVAL;
+        assert_eq!(
+            keys_of(&tracker.scan_with(&system, NOTION, full).unwrap()),
+            [key(101, 3)]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tracker_finds_a_process_started_between_full_scans() {
+        let ping = std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+            .join(r"System32\PING.EXE");
+        let executable = ping.to_string_lossy().to_string();
+        let mut tracker = ProcessTracker::new();
+        let start = Instant::now();
+        tracker.scan(&executable).expect("first full scan");
+
+        let mut child = std::process::Command::new(&ping)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("start ping");
+        let pid = child.id();
+        let found = tracker
+            .scan_with(
+                &SystemProcesses,
+                &executable,
+                start + Duration::from_secs(1),
+            )
+            .expect("incremental scan");
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(child);
+        let record = found
+            .iter()
+            .find(|record| record.key.pid == pid)
+            .expect("the new ping process");
+        assert!(record
+            .command_line
+            .as_deref()
+            .is_some_and(|line| line.contains("127.0.0.1")));
+
+        let after = tracker
+            .scan_with(
+                &SystemProcesses,
+                &executable,
+                start + Duration::from_secs(2),
+            )
+            .expect("incremental scan");
+        assert!(after.iter().all(|record| record.key.pid != pid));
     }
 }
