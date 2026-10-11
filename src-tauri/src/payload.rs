@@ -178,6 +178,14 @@ mod tests {
         assert!(payload.script.contains("const previous = window[STATE];"));
         assert!(payload.script.contains("img:not(.notion-emoji)"));
         assert!(payload.script.contains("border-color: color-mix"));
+        // 居中预览：底罩重绘壁纸（::before 承载 blur，避免模糊面板），
+        // 空白页「开始使用」模板条的渐变与实底需清掉。
+        assert!(payload
+            .script
+            .contains(r#".notion-peek-renderer[style*=\"--ca-oveSmo\"]::before"#));
+        assert!(payload
+            .script
+            .contains(r#"[style*=\"linear-gradient\"][style*=\"--ca-conBacTra\"] + div"#));
         assert!(payload.script.contains("resolveTabChromeHeight"));
         assert!(payload.script.contains("DEFAULT_TAB_CHROME_HEIGHT"));
         assert!(payload.script.contains("tab-chrome-align-v2"));

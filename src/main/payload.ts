@@ -170,6 +170,56 @@ html.notion-background-active .notion-peek-renderer .notion-record-icon img:not(
 }
 
 /*
+ * 居中预览（侧栏「+」新建子页面等）：.notion-peek-renderer 自身变成全屏 fixed 底罩，
+ * 内联 background: var(--ca-oveSmo)（约 0.8 黑）；右侧预览没有这个变量，不受影响。
+ * 面板沿用上面的 surface 雾，底罩若只是透明会与背后页面叠字，因此同设置弹窗一样
+ * 重绘壁纸。面板是底罩的子节点，blur 不能写在底罩本身，改由 ::before 承载。
+ */
+html.notion-background-active .notion-peek-renderer[style*="--ca-oveSmo"] {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+html.notion-background-active .notion-peek-renderer[style*="--ca-oveSmo"]::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-color: var(--cbg-surface-color, #191919);
+  background-image:
+    linear-gradient(
+      color-mix(in srgb, var(--cbg-overlay-color) calc(var(--cbg-overlay-opacity) * 100%), transparent),
+      color-mix(in srgb, var(--cbg-overlay-color) calc(var(--cbg-overlay-opacity) * 100%), transparent)
+    ),
+    linear-gradient(
+      color-mix(in srgb, var(--cbg-surface-color, #191919) calc((1 - var(--cbg-opacity) * var(--cbg-route-intensity)) * 100%), transparent),
+      color-mix(in srgb, var(--cbg-surface-color, #191919) calc((1 - var(--cbg-opacity) * var(--cbg-route-intensity)) * 100%), transparent)
+    ),
+    var(--cbg-media-url);
+  background-size: cover, cover, var(--cbg-bg-size);
+  background-position: center, center, var(--cbg-position-x) var(--cbg-position-y);
+  background-repeat: no-repeat;
+  filter: blur(var(--cbg-blur));
+}
+html.notion-background-active.notion-background-fit-tile .notion-peek-renderer[style*="--ca-oveSmo"]::before {
+  background-repeat: no-repeat, no-repeat, repeat;
+}
+
+/*
+ * 空白页底部「开始使用」模板条：一层 linear-gradient(页面底色 → --ca-conBacTra) 渐变
+ * + 紧随其后的页面底色实底（整页是 --c-bacPri，居中预览里是 --c-bacEle）。
+ * 外层画布已统一打雾，这里两层都清掉，否则正文下方会压出一块黑色阴影。
+ */
+html.notion-background-active .layout-content .content-editable-void-no-select [style*="linear-gradient"][style*="--ca-conBacTra"] {
+  background: transparent !important;
+  background-image: none !important;
+}
+html.notion-background-active .layout-content .content-editable-void-no-select [style*="linear-gradient"][style*="--ca-conBacTra"] + div {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
+/*
  * 页面封面：允许显示，按顶栏/画布滑杆做半透明。
  * 绝不能 visibility:hidden / opacity:0 —— Notion 懒加载会永久停在 1x1 占位图，
  * 连带页面图标也变成 --c-bacPri 黑块。

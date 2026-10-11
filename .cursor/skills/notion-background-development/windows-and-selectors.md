@@ -132,6 +132,27 @@ Notion class 名和 StyleX hash 可能随版本变化。这里记录的是稳定
   （fill → `100% 100%`，tile → `auto` + repeat）。
 - 视频背景时 `background-image` 加载失败，底罩自然回落为表面色实底。
 
+### 居中预览（侧栏「+」新建子页面）
+
+- 与右侧预览共用 `.notion-peek-renderer`，区别：居中时它自身是全屏
+  `position: fixed` 底罩，内联 `background: var(--ca-oveSmo)`（约 0.8 黑）；
+  右侧预览是 `position: absolute; width: 960px`，没有该变量。
+  选择器用 `.notion-peek-renderer[style*="--ca-oveSmo"]` 区分。
+- 面板是底罩的直接子节点 `div[style*="var(--c-bacEle)"]`，沿用右侧预览的
+  `--cbg-surface-opacity` 雾（用户确认跟「顶栏与页面」，不跟菜单）。
+- 底罩透明会与背后页面叠字，处理同设置弹窗：重绘壁纸 + 表面雾 + 底色层。
+  但面板在底罩内部，`filter: blur` 不能写在底罩上，改用 `::before`
+  （`z-index: -1`，底罩自身 `z-index: 99` 构成层叠上下文）。
+
+### 空白页「开始使用」模板条
+
+- 新建空白页底部「Ask AI / AI Meeting Notes / Database / Form / Templates」。
+- 结构：`.layout-content > div(absolute) > .content-editable-void-no-select > div >`
+  渐变层 `linear-gradient(0deg, <页面底色> 0%, var(--ca-conBacTra) 100%)`
+  + 紧邻兄弟实底层（整页 `--c-bacPri`，居中预览 `--c-bacEle`）。
+- 两层都清透明（渐变用 `[style*="--ca-conBacTra"]` 定位，实底用相邻兄弟 `+ div`），
+  外层画布已统一打雾。
+
 ## 路由强度
 
 | Studio 文案 | 设置字段 | 根 class | 用途 |
