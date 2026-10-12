@@ -16,7 +16,7 @@ use std::{
     },
 };
 
-use controller::{NotionController, TargetProbe};
+use controller::{NotionController, RelaunchKind, RelaunchOutcome, RelaunchPoll, TargetProbe};
 use managed_launch::{ManagedAction, ManagedLaunchMachine};
 use models::RuntimeStatus;
 use payload::{build_active_payload_from_bytes, ActivePayload};
@@ -223,6 +223,8 @@ enum ManagedTickOutcome {
     Attach,
     Takeover,
     ReleaseStale,
+    /// 被结束的 Notion 已彻底退出，执行登记过的重启。
+    Relaunch,
 }
 
 fn prepare_managed_tick(
@@ -246,6 +248,10 @@ fn prepare_managed_tick(
 }
 
 fn classify_managed_tick(state: &WorkerState) -> Result<ManagedTickOutcome, String> {
+    // 待重启优先于一切：即便尚未配置/已暂停，被插件关掉的 Notion 也必须重新拉起。
+    if let Some(outcome) = poll_pending_relaunch(state)? {
+        return Ok(outcome);
+    }
     if !state.is_configured() {
         let mut controller = lock(&state.controller)?;
         return Ok(
@@ -292,6 +298,52 @@ fn classify_managed_tick(state: &WorkerState) -> Result<ManagedTickOutcome, Stri
             Ok(ManagedTickOutcome::Idle)
         }
     }
+}
+
+fn poll_pending_relaunch(state: &WorkerState) -> Result<Option<ManagedTickOutcome>, String> {
+    let mut controller = lock(&state.controller)?;
+    if !controller.relaunch_pending() {
+        return Ok(None);
+    }
+    let outcome = match controller.poll_relaunch() {
+        Ok(RelaunchPoll::Due) => ManagedTickOutcome::Relaunch,
+        Ok(RelaunchPoll::Waiting) => ManagedTickOutcome::StatusChanged,
+        Ok(RelaunchPoll::Superseded(kind)) => {
+            // 用户在等待期间自己启动了 Notion：交还给常规托管流程，按新启动处理。
+            if kind == RelaunchKind::Managed && !controller.managed_paused() {
+                let _ = controller.take_rearm_request();
+                let mut machine = lock(&state.managed_machine)?;
+                machine.fail_takeover(&[]);
+                let (phase, message) = machine.watch_status();
+                let _ = controller.set_watch_status(&phase, &message);
+            }
+            ManagedTickOutcome::StatusChanged
+        }
+        Err(_) => {
+            let probe = controller
+                .probe_target()
+                .unwrap_or_else(|_| TargetProbe::empty());
+            lock(&state.managed_machine)?.fail_takeover(&probe.processes);
+            ManagedTickOutcome::StatusChanged
+        }
+    };
+    Ok(Some(outcome))
+}
+
+fn run_pending_relaunch(state: &WorkerState) -> Result<(), String> {
+    let payload = state.active_payload().ok();
+    let mut controller = lock(&state.controller)?;
+    let result = controller.run_pending_relaunch(payload);
+    let probe = controller
+        .probe_target()
+        .unwrap_or_else(|_| TargetProbe::empty());
+    let mut machine = lock(&state.managed_machine)?;
+    match &result {
+        Ok(RelaunchOutcome::Attached) => machine.mark_active(&probe.processes),
+        Ok(RelaunchOutcome::Official | RelaunchOutcome::Retrying | RelaunchOutcome::Idle) => {}
+        Err(_) => machine.fail_takeover(&probe.processes),
+    }
+    result.map(|_| ())
 }
 
 fn apply_managed_action(state: &WorkerState, payload: ActivePayload) -> Result<(), String> {
@@ -436,6 +488,16 @@ async fn run_managed_launch_worker(state: Arc<WorkerState>) {
                 .unwrap_or_else(|error| Err(error.to_string()))
                 {
                     eprintln!("清理失效会话失败：{error}");
+                }
+            }
+            ManagedTickOutcome::Relaunch => {
+                let worker = Arc::clone(&state);
+                if let Err(error) =
+                    tokio::task::spawn_blocking(move || run_pending_relaunch(&worker))
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()))
+                {
+                    eprintln!("重新启动 Notion 失败：{error}");
                 }
             }
             _ => {}

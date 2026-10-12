@@ -1,9 +1,10 @@
 use std::{
+    collections::HashSet,
     fs,
     net::TcpListener,
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -27,6 +28,72 @@ use crate::{
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const PREFERRED_DEBUG_PORT: u16 = 9226;
+/// 强制结束后先同步等这么久；多数情况下 Notion 在此期间就已彻底退出。
+const EXIT_QUICK_WAIT: Duration = Duration::from_secs(15);
+const DEBUG_PORT_WAIT: Duration = Duration::from_secs(45);
+/// 官方外观重启后观察这么久，确认新进程没有因单实例锁被立即放弃。
+const OFFICIAL_LAUNCH_SETTLE: Duration = Duration::from_secs(20);
+const RELAUNCH_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+const RELAUNCH_MAX_ATTEMPTS: u8 = 10;
+/// 等旧进程退出的总时长上限；超过后报错，避免无限期停在"等待退出"。
+const RELAUNCH_MAX_WAIT: Duration = Duration::from_secs(600);
+
+pub const MSG_WAIT_EXIT_MANAGED: &str = "等待旧的 Notion 进程完全退出，随后自动重启并应用背景";
+pub const MSG_WAIT_EXIT_OFFICIAL: &str = "等待旧的 Notion 进程完全退出，随后自动以官方外观重启";
+const MSG_RELAUNCH_FAILED: &str =
+    "旧的 Notion 进程长时间未释放，自动重启多次失败，请稍后手动启动 Notion。";
+
+/// 强制结束后 Notion 进程可能在进程表中滞留数十秒到数分钟（期间仍占着单实例锁，
+/// 新启动的进程会直接退出）。这类情况下不再报错放弃，而是登记一次待重启，由
+/// watcher 在旧进程真正消失后重新启动，保证被插件关掉的 Notion 一定会被拉起来。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelaunchKind {
+    /// 带本机调试端口重启并注入背景。
+    Managed,
+    /// 以官方外观（无调试参数）重启。
+    Official,
+}
+
+struct RelaunchPlan {
+    kind: RelaunchKind,
+    /// 登记时仍滞留的旧进程；出现不在其中的新进程说明用户已自行启动了 Notion。
+    lingering: HashSet<ProcessKey>,
+    /// 本插件为重启而拉起的主进程 PID，不能被当成"用户自行启动"。
+    own_pids: HashSet<u32>,
+    attempts: u8,
+    not_before: Instant,
+    /// 首次登记待重启的时间，重试时沿用。
+    since: Instant,
+    /// 官方外观重启后正在观察的子进程：若它很快自行退出说明旧实例仍占着锁，需重试。
+    watch: Option<(Child, Instant)>,
+}
+
+pub enum RelaunchPoll {
+    /// 旧进程仍在退出，继续等待。
+    Waiting,
+    /// 旧进程已全部消失，可以重启。
+    Due,
+    /// 用户在等待期间自行启动了 Notion，待重启已取消。
+    Superseded(RelaunchKind),
+}
+
+pub enum RelaunchOutcome {
+    Attached,
+    Official,
+    Retrying,
+    Idle,
+}
+
+enum DebugLaunch {
+    Ready {
+        port: u16,
+        browser_id: String,
+    },
+    /// 新进程没打开调试端口就退出了：旧实例仍持有单实例锁。
+    ExitedEarly {
+        pid: u32,
+    },
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -256,7 +323,9 @@ $ports = @(Get-CimInstance Win32_Process -Filter "Name='Notion.exe'" | Where-Obj
         .collect())
 }
 
-fn stop_verified_notion(install: &NotionInstall) -> Result<(), String> {
+/// 结束所有路径匹配的 Notion 进程。返回 `false` 表示进程在快速等待窗口内
+/// 尚未从进程表消失（仍在退出），调用方须登记待重启而不是立即启动。
+fn stop_verified_notion(install: &NotionInstall) -> Result<bool, String> {
     let script = format!(
         r#"
 $ErrorActionPreference = 'Stop'
@@ -269,17 +338,17 @@ foreach ($item in $processes) {{ Stop-Process -Id ([int]$item.ProcessId) -Force 
         powershell_quote(&normalized_path(&install.executable))
     );
     run_powershell(&script, Duration::from_secs(30))?;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + EXIT_QUICK_WAIT;
     while !process_ids_for(install)?.is_empty() {
         if Instant::now() >= deadline {
-            return Err("Notion 未能在 15 秒内完全退出。".to_string());
+            return Ok(false);
         }
         thread::sleep(Duration::from_millis(300));
     }
-    Ok(())
+    Ok(true)
 }
 
-fn launch_notion(install: &NotionInstall, arguments: &[String]) -> Result<(), String> {
+fn launch_notion(install: &NotionInstall, arguments: &[String]) -> Result<Child, String> {
     let executable = PathBuf::from(&install.executable);
     if !executable.is_file() {
         return Err("Notion 可执行文件不存在。".to_string());
@@ -290,8 +359,40 @@ fn launch_notion(install: &NotionInstall, arguments: &[String]) -> Result<(), St
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|error| format!("启动 Notion 失败：{error}"))?;
-    Ok(())
+        .map_err(|error| format!("启动 Notion 失败：{error}"))
+}
+
+fn launch_debug_session(install: &NotionInstall) -> Result<DebugLaunch, String> {
+    let port = select_port(PREFERRED_DEBUG_PORT)?;
+    let mut child = launch_notion(
+        install,
+        &[
+            "--remote-debugging-address=127.0.0.1".to_string(),
+            format!("--remote-debugging-port={port}"),
+        ],
+    )?;
+    let deadline = Instant::now() + DEBUG_PORT_WAIT;
+    loop {
+        if let Ok(browser_id) = read_browser_identity(port) {
+            return Ok(DebugLaunch::Ready { port, browser_id });
+        }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return Ok(DebugLaunch::ExitedEarly { pid: child.id() });
+        }
+        if Instant::now() >= deadline {
+            // 本次启动的进程一直没开调试端口：结束它，避免挡住后续重试（单实例锁）。
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Notion 未能在 45 秒内打开安全的本机调试端口。".to_string());
+        }
+        thread::sleep(Duration::from_millis(400));
+    }
+}
+
+fn lingering_keys(install: &NotionInstall) -> HashSet<ProcessKey> {
+    snapshot_matching_executable(&install.executable)
+        .map(|records| records.into_iter().map(|record| record.key).collect())
+        .unwrap_or_default()
 }
 
 fn select_port(preferred: u16) -> Result<u16, String> {
@@ -341,6 +442,7 @@ pub struct NotionController {
     managed_mode: bool,
     managed_paused: bool,
     rearm_requested: bool,
+    relaunch: Option<RelaunchPlan>,
 }
 
 impl NotionController {
@@ -360,6 +462,7 @@ impl NotionController {
             managed_mode: false,
             managed_paused: false,
             rearm_requested: false,
+            relaunch: None,
         }
     }
 
@@ -419,6 +522,270 @@ impl NotionController {
         if let Some(mut engine) = self.engine.take() {
             engine.abandon();
         }
+    }
+
+    pub fn relaunch_pending(&self) -> bool {
+        self.relaunch.is_some()
+    }
+
+    /// 暂停（含恢复官方外观）期间不再注入，待重启统一按官方外观执行。
+    fn effective_relaunch_kind(&self, kind: RelaunchKind) -> RelaunchKind {
+        if self.managed_paused {
+            RelaunchKind::Official
+        } else {
+            kind
+        }
+    }
+
+    fn show_relaunch_wait(&mut self, kind: RelaunchKind) {
+        let (phase, message) = match self.effective_relaunch_kind(kind) {
+            RelaunchKind::Managed => ("starting", MSG_WAIT_EXIT_MANAGED),
+            RelaunchKind::Official => ("restoring", MSG_WAIT_EXIT_OFFICIAL),
+        };
+        self.status.phase = phase.to_string();
+        self.status.message = message.to_string();
+        self.status.last_error = None;
+        self.status.active_targets = 0;
+    }
+
+    fn fail_relaunch(&mut self, error: &str) {
+        self.relaunch = None;
+        self.status.phase = "error".to_string();
+        self.status.message = error.to_string();
+        self.status.last_error = Some(error.to_string());
+    }
+
+    /// 登记待重启。`attempts` 为已经失败的启动次数；`own_pid` 是刚刚自行退出的、
+    /// 由本插件启动的主进程（它可能仍滞留在进程表中）。
+    fn schedule_relaunch(
+        &mut self,
+        install: &NotionInstall,
+        kind: RelaunchKind,
+        attempts: u8,
+        own_pid: Option<u32>,
+        delay: Duration,
+    ) {
+        let (mut own_pids, since) = self
+            .relaunch
+            .take()
+            .map(|plan| (plan.own_pids, plan.since))
+            .unwrap_or_else(|| (HashSet::new(), Instant::now()));
+        own_pids.extend(own_pid);
+        self.relaunch = Some(RelaunchPlan {
+            kind,
+            lingering: lingering_keys(install),
+            own_pids,
+            attempts,
+            not_before: Instant::now() + delay,
+            since,
+            watch: None,
+        });
+        self.show_relaunch_wait(kind);
+    }
+
+    fn finish_official_relaunch(&mut self, kind: RelaunchKind) {
+        let (phase, message) = if self.managed_paused {
+            ("paused", "暂停托管")
+        } else if kind == RelaunchKind::Official {
+            ("idle", "已恢复官方外观")
+        } else {
+            ("idle", "已重新启动 Notion")
+        };
+        self.status.phase = phase.to_string();
+        self.status.message = message.to_string();
+        self.status.last_error = None;
+        self.status.active_targets = 0;
+    }
+
+    /// 以官方外观启动，并登记观察：新进程若很快自行退出，由 watcher 重试。
+    fn launch_official_watched(
+        &mut self,
+        install: &NotionInstall,
+        kind: RelaunchKind,
+        attempts: u8,
+    ) -> Result<(), String> {
+        let child = launch_notion(install, &[])?;
+        let (mut own_pids, since) = self
+            .relaunch
+            .take()
+            .map(|plan| (plan.own_pids, plan.since))
+            .unwrap_or_else(|| (HashSet::new(), Instant::now()));
+        own_pids.insert(child.id());
+        self.relaunch = Some(RelaunchPlan {
+            kind,
+            lingering: HashSet::new(),
+            own_pids,
+            attempts,
+            not_before: Instant::now(),
+            since,
+            watch: Some((child, Instant::now() + OFFICIAL_LAUNCH_SETTLE)),
+        });
+        self.finish_official_relaunch(kind);
+        Ok(())
+    }
+
+    /// watcher 每个 tick 调用：判断旧进程是否已彻底退出、用户是否已自行启动 Notion。
+    pub fn poll_relaunch(&mut self) -> Result<RelaunchPoll, String> {
+        let install = self.discover_cached()?;
+        let Some(plan) = self.relaunch.as_mut() else {
+            return Ok(RelaunchPoll::Waiting);
+        };
+        let kind = plan.kind;
+        if let Some((child, deadline)) = plan.watch.as_mut() {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                let attempts = plan.attempts.saturating_add(1);
+                if attempts >= RELAUNCH_MAX_ATTEMPTS {
+                    self.fail_relaunch(MSG_RELAUNCH_FAILED);
+                    return Err(MSG_RELAUNCH_FAILED.to_string());
+                }
+                self.schedule_relaunch(&install, kind, attempts, None, RELAUNCH_RETRY_INTERVAL);
+            } else if Instant::now() >= *deadline {
+                self.relaunch = None;
+            }
+            return Ok(RelaunchPoll::Waiting);
+        }
+        let records = snapshot_matching_executable(&install.executable)?;
+        let user_launched = records.iter().any(|record| {
+            !plan.lingering.contains(&record.key)
+                && !plan.own_pids.contains(&record.key.pid)
+                && record
+                    .command_line
+                    .as_deref()
+                    .is_some_and(|line| !line.contains("--type="))
+        });
+        if user_launched {
+            self.relaunch = None;
+            if self.effective_relaunch_kind(kind) == RelaunchKind::Official {
+                self.finish_official_relaunch(kind);
+            }
+            return Ok(RelaunchPoll::Superseded(kind));
+        }
+        let due = records.is_empty() && Instant::now() >= plan.not_before;
+        if !due && plan.since.elapsed() >= RELAUNCH_MAX_WAIT {
+            self.fail_relaunch(MSG_RELAUNCH_FAILED);
+            return Err(MSG_RELAUNCH_FAILED.to_string());
+        }
+        self.show_relaunch_wait(kind);
+        Ok(if due {
+            RelaunchPoll::Due
+        } else {
+            RelaunchPoll::Waiting
+        })
+    }
+
+    /// 旧进程已全部退出后由 watcher 调用：按待重启类型重新启动 Notion。
+    pub fn run_pending_relaunch(
+        &mut self,
+        payload: Option<ActivePayload>,
+    ) -> Result<RelaunchOutcome, String> {
+        let Some(plan) = self.relaunch.as_ref() else {
+            return Ok(RelaunchOutcome::Idle);
+        };
+        if plan.watch.is_some() {
+            return Ok(RelaunchOutcome::Idle);
+        }
+        let kind = plan.kind;
+        let attempts = plan.attempts;
+        let install = match discover_notion() {
+            Ok(install) => install,
+            Err(error) => {
+                self.fail_relaunch(&error);
+                return Err(error);
+            }
+        };
+        if !snapshot_matching_executable(&install.executable)?.is_empty() {
+            return Ok(RelaunchOutcome::Retrying);
+        }
+        let payload = match self.effective_relaunch_kind(kind) {
+            RelaunchKind::Managed => payload,
+            RelaunchKind::Official => None,
+        };
+        let Some(payload) = payload else {
+            if let Err(error) = self.launch_official_watched(&install, kind, attempts) {
+                return self.retry_after_launch_error(&install, kind, attempts, None, error, false);
+            }
+            return Ok(RelaunchOutcome::Official);
+        };
+        self.status.phase = "starting".to_string();
+        self.status.message = "正在重新启动 Notion".to_string();
+        match launch_debug_session(&install) {
+            Ok(DebugLaunch::Ready { port, browser_id }) => {
+                if let Err(error) = self.attach_launched(&install, port, browser_id, payload) {
+                    self.fail_relaunch(&error);
+                    return Err(error);
+                }
+                self.status.message = "背景已自动应用".to_string();
+                Ok(RelaunchOutcome::Attached)
+            }
+            Ok(DebugLaunch::ExitedEarly { pid }) => self.retry_after_launch_error(
+                &install,
+                kind,
+                attempts,
+                Some(pid),
+                MSG_RELAUNCH_FAILED.to_string(),
+                true,
+            ),
+            Err(error) => {
+                self.retry_after_launch_error(&install, kind, attempts, None, error, false)
+            }
+        }
+    }
+
+    /// 被插件关掉的 Notion 必须重新拉起来，启动失败不能直接放弃：
+    /// - 仍有滞留进程（含刚失败的这次启动留下的）时继续等待，不计入失败次数，
+    ///   总时长由 `RELAUNCH_MAX_WAIT` 兜底；
+    /// - 进程已清空仍失败，则计一次失败，间隔后重试，达到上限才报告最后一次错误。
+    fn retry_after_launch_error(
+        &mut self,
+        install: &NotionInstall,
+        kind: RelaunchKind,
+        attempts: u8,
+        own_pid: Option<u32>,
+        error: String,
+        always_count: bool,
+    ) -> Result<RelaunchOutcome, String> {
+        let cleared = snapshot_matching_executable(&install.executable)
+            .map(|records| records.is_empty())
+            .unwrap_or(false);
+        let attempts = if always_count || cleared {
+            attempts.saturating_add(1)
+        } else {
+            attempts
+        };
+        if attempts >= RELAUNCH_MAX_ATTEMPTS {
+            let error = format!("{MSG_RELAUNCH_FAILED}（{error}）");
+            self.fail_relaunch(&error);
+            return Err(error);
+        }
+        self.schedule_relaunch(install, kind, attempts, own_pid, RELAUNCH_RETRY_INTERVAL);
+        Ok(RelaunchOutcome::Retrying)
+    }
+
+    /// 记录新启动的调试会话并开始注入。
+    fn attach_launched(
+        &mut self,
+        install: &NotionInstall,
+        port: u16,
+        browser_id: String,
+        payload: ActivePayload,
+    ) -> Result<(), String> {
+        self.write_state(Some(RuntimeState {
+            schema_version: 1,
+            port,
+            browser_id: browser_id.clone(),
+            package_full_name: install.package_full_name.clone(),
+            executable: install.executable.clone(),
+            created_at: Utc::now().to_rfc3339(),
+        }))?;
+        let mut engine = InjectorEngine::new(port, browser_id);
+        engine.start(payload)?;
+        self.engine = Some(engine);
+        self.relaunch = None;
+        self.status.phase = "active".to_string();
+        self.status.message = "背景已应用".to_string();
+        self.status.last_error = None;
+        self.status.notion_version = Some(install.version.clone());
+        Ok(())
     }
 
     fn mark_managed_applied(&mut self) {
@@ -570,6 +937,7 @@ impl NotionController {
         match self.try_attach_inner(payload) {
             Ok(attached) => {
                 if attached {
+                    self.relaunch = None;
                     self.mark_managed_applied();
                 }
                 Ok(attached)
@@ -617,7 +985,7 @@ impl NotionController {
             }
         }
         let result = self.apply(payload, true);
-        if result.is_ok() && self.managed_mode {
+        if result.is_ok() && self.managed_mode && self.status.phase == "active" {
             self.status.message = "背景已自动应用".to_string();
         }
         result
@@ -730,46 +1098,63 @@ impl NotionController {
                 self.status.notion_version = Some(install.version);
                 return Ok(self.status());
             }
+            // 正在等待被结束的旧进程退出：不再重复结束/等待，保持待重启即可。
+            if let Some(plan) = self.relaunch.as_mut() {
+                if plan.watch.is_none() {
+                    let records = snapshot_matching_executable(&install.executable)?;
+                    if !records.is_empty()
+                        && records
+                            .iter()
+                            .all(|record| plan.lingering.contains(&record.key))
+                    {
+                        plan.kind = RelaunchKind::Managed;
+                        self.show_relaunch_wait(RelaunchKind::Managed);
+                        return Ok(self.status());
+                    }
+                }
+            }
             let running = process_ids_for(&install)?;
             if !running.is_empty() && !restart_existing {
                 return Err("Notion 需要重启一次以启用背景。".to_string());
             }
-            if !running.is_empty() {
-                stop_verified_notion(&install)?;
+            let killed = !running.is_empty();
+            if killed && !stop_verified_notion(&install)? {
+                // 已被结束但仍滞留在进程表中，此时启动会被单实例锁吞掉。
+                self.schedule_relaunch(&install, RelaunchKind::Managed, 0, None, Duration::ZERO);
+                return Ok(self.status());
             }
-            let port = select_port(PREFERRED_DEBUG_PORT)?;
-            launch_notion(
-                &install,
-                &[
-                    "--remote-debugging-address=127.0.0.1".to_string(),
-                    format!("--remote-debugging-port={port}"),
-                ],
-            )?;
-            let deadline = Instant::now() + Duration::from_secs(45);
-            let browser_id = loop {
-                if let Ok(identity) = read_browser_identity(port) {
-                    break identity;
+            let launched = match launch_debug_session(&install) {
+                Ok(launched) => launched,
+                // 刚被本插件结束的 Notion 不能就此停在关闭状态：转入待重启继续尝试。
+                Err(error) if killed => {
+                    self.retry_after_launch_error(
+                        &install,
+                        RelaunchKind::Managed,
+                        0,
+                        None,
+                        error,
+                        false,
+                    )?;
+                    return Ok(self.status());
                 }
-                if Instant::now() >= deadline {
-                    return Err("Notion 未能在 45 秒内打开安全的本机调试端口。".to_string());
-                }
-                thread::sleep(Duration::from_millis(400));
+                Err(error) => return Err(error),
             };
-            self.write_state(Some(RuntimeState {
-                schema_version: 1,
-                port,
-                browser_id: browser_id.clone(),
-                package_full_name: install.package_full_name,
-                executable: install.executable,
-                created_at: Utc::now().to_rfc3339(),
-            }))?;
-            let mut engine = InjectorEngine::new(port, browser_id);
-            engine.start(payload)?;
-            self.engine = Some(engine);
-            self.status.phase = "active".to_string();
-            self.status.message = "背景已应用".to_string();
-            self.status.notion_version = Some(install.version);
-            Ok(self.status())
+            match launched {
+                DebugLaunch::Ready { port, browser_id } => {
+                    self.attach_launched(&install, port, browser_id, payload)?;
+                    Ok(self.status())
+                }
+                DebugLaunch::ExitedEarly { pid } => {
+                    self.schedule_relaunch(
+                        &install,
+                        RelaunchKind::Managed,
+                        1,
+                        Some(pid),
+                        RELAUNCH_RETRY_INTERVAL,
+                    );
+                    Ok(self.status())
+                }
+            }
         })();
         if let Err(error) = &result {
             self.status.phase = if error.contains("需要重启一次") {
@@ -781,6 +1166,9 @@ impl NotionController {
             self.status.last_error = Some(error.clone());
         }
         if result.is_ok() {
+            if self.status.phase == "active" {
+                self.relaunch = None;
+            }
             self.mark_managed_applied();
         }
         result
@@ -810,9 +1198,22 @@ impl NotionController {
                 engine.stop()?;
             }
             let install = discover_notion()?;
+            let watching = self
+                .relaunch
+                .as_ref()
+                .is_some_and(|plan| plan.watch.is_some());
+            let mut pending = false;
             if !process_ids_for(&install)?.is_empty() {
-                stop_verified_notion(&install)?;
-                launch_notion(&install, &[])?;
+                if watching {
+                    // 刚以官方外观重启过且仍在观察，不再重复结束。
+                } else if stop_verified_notion(&install)? {
+                    self.launch_official_watched(&install, RelaunchKind::Official, 0)?;
+                } else {
+                    pending = true;
+                }
+            } else if self.relaunch.is_some() && !watching {
+                // 之前被结束的 Notion 尚未重启：改为以官方外观重启。
+                pending = true;
             }
             self.write_state(None)?;
             if self.managed_mode {
@@ -823,8 +1224,13 @@ impl NotionController {
                 self.status.phase = "idle".to_string();
                 self.status.message = "已恢复官方外观".to_string();
             }
-            self.status.notion_version = Some(install.version);
+            self.status.notion_version = Some(install.version.clone());
             self.status.active_targets = 0;
+            if pending {
+                self.schedule_relaunch(&install, RelaunchKind::Official, 0, None, Duration::ZERO);
+            } else if let Some(plan) = self.relaunch.as_mut() {
+                plan.kind = RelaunchKind::Official;
+            }
             Ok(self.status())
         })();
         if let Err(error) = &result {

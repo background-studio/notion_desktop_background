@@ -337,9 +337,12 @@ impl ManagedLaunchMachine {
             }
             ManagedPhase::AttachPending => {
                 if overlaps_known {
-                    self.absorb(&observation.processes);
-                    self.confirm_ticks = 0;
-                    return ManagedAction::Stay;
+                    // 走到这里说明已经没有调试会话、也没有带调试参数的进程：要接管的调试
+                    // 实例已不在了（例如托管的 Notion 被结束、用户随即重开了普通 Notion，
+                    // 新进程在旧实例滞留期间被一并记入）。不能一直停在"正在接管"，按已在运行
+                    // 的普通实例处理，等待用户点应用（协议约定不静默关闭普通进程）。
+                    self.fail_takeover(&observation.processes);
+                    return ManagedAction::HoldExisting;
                 }
                 self.begin_fresh_confirmation(&observation.processes);
                 ManagedAction::Wait
@@ -894,6 +897,29 @@ mod tests {
         assert_eq!(machine.decide(&observation(&[])), ManagedAction::Wait);
         assert_eq!(machine.phase(), ManagedPhase::Waiting);
         assert_eq!(machine.status_copy(), ("idle", "已启用，等待 Notion 启动"));
+    }
+
+    #[test]
+    fn attach_pending_does_not_hang_after_debug_instance_vanishes() {
+        // 托管实例被结束后仍滞留（带调试参数），用户随即重开普通 Notion。
+        let dying = key(41, 400);
+        let fresh = key(42, 410);
+        let mut machine = ManagedLaunchMachine::new();
+        machine.arm(&[]);
+        let mut debug = observation(&[dying, fresh]);
+        debug.has_debug_launch = true;
+        assert_eq!(machine.decide(&debug), ManagedAction::WaitForDebug);
+        assert_eq!(machine.phase(), ManagedPhase::AttachPending);
+        // 滞留实例消失后只剩普通进程：不能一直停在"正在接管"。
+        assert_eq!(
+            machine.decide(&observation(&[fresh])),
+            ManagedAction::HoldExisting
+        );
+        assert_eq!(machine.phase(), ManagedPhase::ExistingUnmanaged);
+        assert_eq!(
+            machine.status_copy(),
+            ("idle", "Notion 已在运行，点立即接管可重启")
+        );
     }
 
     #[test]
