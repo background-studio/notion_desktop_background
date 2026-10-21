@@ -186,6 +186,22 @@ mod tests {
         assert!(payload
             .script
             .contains(r#"[style*=\"linear-gradient\"][style*=\"--ca-conBacTra\"] + div"#));
+        // 日历视图吸顶表头 / 周末日格 / 条目卡片，以及嵌入块占位底，都需跟随背景透明度。
+        assert!(payload
+            .script
+            .contains(r#".notion-calendar-view [style*=\"--c-bacPri\"]"#));
+        assert!(payload.script.contains(
+            r#".notion-calendar-view .notion-collection_view-block[style*=\"--c-bacSec\"]"#
+        ));
+        assert!(payload
+            .script
+            .contains(r#".notion-calendar-view [style*=\"--c-calIteBac\"]"#));
+        assert!(payload
+            .script
+            .contains(r#".notion-embed-block [style*=\"--c-bacPri\"]"#));
+        assert!(payload
+            .script
+            .contains(r#".notion-list-view [style*=\"--c-bacPri\"]"#));
         assert!(payload.script.contains("resolveTabChromeHeight"));
         assert!(payload.script.contains("DEFAULT_TAB_CHROME_HEIGHT"));
         assert!(payload.script.contains("tab-chrome-align-v2"));

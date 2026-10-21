@@ -97,6 +97,28 @@ Notion class 名和 StyleX hash 可能随版本变化。这里记录的是稳定
   以及带 `clip-path` 的包装层。
 - 跟随 `--cbg-surface-opacity`；包装层直接透明。
 
+### 日历视图
+
+- 入口：`.notion-calendar-view`（整页或内联数据库通用）。
+- 吸顶「年月 + 周日…周六」表头：z-index 85 的绝对定位层，内联
+  `background: var(--c-bacPri)`；视图内只有它用 `--c-bacPri`。
+- 周末日格：`.notion-collection_view-block` 内联 `background: var(--c-bacSec)`，
+  工作日格本身透明。表头和周末格都跟随 `--cbg-surface-opacity`（`* 28%`）。
+- 条目卡片：内联 `background: var(--c-calIteBac)` + `--c-shaOutSm`，跟随 surface（`* 40%`），清阴影。
+- 悬停「+」按钮走 `--c-popBac`（悬浮按钮），不处理；今日红圈 `--c-redBacAccPri` 保留。
+
+### 分组列表视图
+
+- 入口：`.notion-list-view`。
+- 吸顶分组标题条（如「2026年10月 1」）：`.hide-scrollbar`，z-index 87，内联
+  `background: var(--c-bacPri)`；视图内只有它用 `--c-bacPri`。跟随 surface（`* 28%`）。
+
+### 嵌入块
+
+- `.notion-embed-block` 的加载占位层和 `<iframe>` 都内联 `background-color: var(--c-bacPri)`，清透明。
+- iframe 内是跨域第三方页面（如 indify 进度条组件），其自带底色不在注入白名单内，
+  需在组件自身设置里改透明。
+
 ## 色块底（折叠块 / 高亮块）
 
 - 用户感知：绿「已完成」、红「未开始」、棕「进行中」等块底色。

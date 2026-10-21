@@ -337,6 +337,48 @@ html.notion-background-active main.notion-frame .sticky-portal-target [style*="-
   backdrop-filter: none !important;
 }
 
+/*
+ * 数据库日历视图（.notion-calendar-view）：
+ * - 吸顶的「年月 + 周日…周六」表头：内联 background: var(--c-bacPri)（z-index 85 的绝对定位层）；
+ * - 周末日格：.notion-collection_view-block 内联 background: var(--c-bacSec)，工作日格本身透明。
+ * 两者跟表头一样走 surface 雾（* 28%），为 0 时整块透出背景；周末在滑杆调高时仍略深于工作日。
+ */
+html.notion-background-active .notion-calendar-view [style*="--c-bacPri"],
+html.notion-background-active .notion-calendar-view .notion-collection_view-block[style*="--c-bacSec"] {
+  background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 28%), transparent) !important;
+  background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 28%), transparent) !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+}
+/* 日历里的条目卡片：内联 background: var(--c-calIteBac) + --c-shaOutSm，同行内快捷条走 * 40%。 */
+html.notion-background-active .notion-calendar-view [style*="--c-calIteBac"] {
+  background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 40%), transparent) !important;
+  background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 40%), transparent) !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+}
+
+/*
+ * 分组列表视图（.notion-list-view）：吸顶分组标题条（如「2026年10月 1」）是
+ * z-index 87 的 .hide-scrollbar，内联 background: var(--c-bacPri)。跟表头同一套 surface 雾。
+ */
+html.notion-background-active .notion-list-view [style*="--c-bacPri"] {
+  background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 28%), transparent) !important;
+  background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 28%), transparent) !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+}
+
+/*
+ * 嵌入块（.notion-embed-block）：加载占位层和 <iframe> 本身都写死
+ * background-color: var(--c-bacPri)，第三方内容透明时会露出一块黑底。
+ * 只清 Notion 自己的底；iframe 内部跨域页面自带的底色不归注入管。
+ */
+html.notion-background-active .notion-embed-block [style*="--c-bacPri"] {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+
 /* 顶部 Electron 标签栏：清掉每个标签芯片的实色底，露出同一张背景。 */
 html.notion-background-tab-chrome,
 html.notion-background-tab-chrome body,
