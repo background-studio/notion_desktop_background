@@ -7,6 +7,14 @@ Notion class 名和 StyleX hash 可能随版本变化。这里记录的是稳定
 
 ### Electron 顶部标签栏（含 Windows 最小化/最大化/关闭那一行）
 
+> **Notion 7.44+（虚拟标签页）**：标签栏不再是独立 page，CDP 里也看不到
+> `tabs/index.html` target。它并进了主页面：`.notion-virtual-tab-container` 内
+> `position: fixed; height: 40px` 的 `.notion-desktop-drag-area`，内联
+> `background-color: var(--c-bacPri)`（实黑）。用
+> `.notion-virtual-tab-container .notion-desktop-drag-area[style*="--c-bacPri"]` 跟 surface 雾；
+> 此时主页 `innerHeight == outerHeight`，背景媒体 `top: 0`、高度取 `innerHeight`，
+> 不再上移拼接（`hasInPageTabBar()`）。下面是旧版独立标签栏的说明。
+
 - 独立 page：`file:///.../app.asar/.webpack/renderer/tabs/index.html`
 - 典型高度约 `36px`；主内容在标签栏下方，二者 `innerHeight` 之和才是内容区总高。
 - **不要**用主页的 `outerHeight - innerHeight` 当标签栏高度：Windows 还原窗口时

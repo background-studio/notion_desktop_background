@@ -205,6 +205,12 @@ mod tests {
         assert!(payload.script.contains("resolveTabChromeHeight"));
         assert!(payload.script.contains("DEFAULT_TAB_CHROME_HEIGHT"));
         assert!(payload.script.contains("tab-chrome-align-v2"));
+        // Notion 7.44+ 标签栏并入主页面：实底拖拽栏跟 surface 雾，背景不再上移拼接。
+        assert!(payload.script.contains("tab-chrome-align-v3"));
+        assert!(payload.script.contains("hasInPageTabBar"));
+        assert!(payload.script.contains(
+            r#".notion-virtual-tab-container .notion-desktop-drag-area[style*=\"--c-bacPri\"]"#
+        ));
         assert!(payload.script.contains("hover-install-v3"));
         assert!(payload.script.contains("Skip no-op writes"));
         assert!(payload

@@ -401,6 +401,19 @@ html.notion-background-tab-chrome [style*="linear-gradient"][style*="--gradient-
   background-image: none !important;
 }
 
+/*
+ * Notion 7.44+ 把标签栏并进主页面（虚拟标签页，不再是独立 tabs/index.html page）：
+ * .notion-virtual-tab-container 内 position: fixed 的 .notion-desktop-drag-area，
+ * 内联 background-color: var(--c-bacPri)，盖在背景图上成了一条实黑栏。
+ * 跟顶栏同一套 surface 雾；标签芯片自身是半透明 --ca-bacIntTra，保留。
+ */
+html.notion-background-active .notion-virtual-tab-container .notion-desktop-drag-area[style*="--c-bacPri"] {
+  background: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 28%), transparent) !important;
+  background-color: color-mix(in srgb, var(--cbg-surface-color, #191919) calc(var(--cbg-surface-opacity) * 28%), transparent) !important;
+  backdrop-filter: none !important;
+  box-shadow: none !important;
+}
+
 /* 弹出菜单、对话框按菜单透明度打底。 */
 html.notion-background-active .notion-overlay-container [role="dialog"],
 html.notion-background-active .notion-overlay-container [role="menu"],
@@ -448,6 +461,7 @@ html.notion-background-active .notion-space-settings [role="dialog"] [role="tabp
 }
 
 /* tab-chrome-align-v2: Windows outerHeight includes OS frame; do not use outer-inner as tab shift. */
+/* tab-chrome-align-v3: in-page virtual tab bar (Notion 7.44+) needs no seam shift. */
 /* hover-install-v3: ignore descendant hover class churn; avoid wallpaper jitter. */
 html.notion-background-dark #notion-background-layer {
   background-color: transparent;
@@ -583,9 +597,13 @@ export function buildRendererPayload(input: PayloadInput) {
     };
 
     const isTabChrome = () => location.protocol === "file:" && location.href.toLowerCase().includes("/tabs/index.html");
+    // Notion 7.44+ 标签栏在主页面里渲染（.notion-virtual-tab-container），没有独立的
+    // Tab Bar page 需要拼接；此时主页 innerHeight 就是整窗内容高，不能再上移 36px。
+    const hasInPageTabBar = () => !isTabChrome() && !!document.querySelector(".notion-virtual-tab-container");
 
     const resolveTabChromeHeight = (viewH) => {
       if (isTabChrome()) return viewH;
+      if (hasInPageTabBar()) return 0;
       const outerH = Number(window.outerHeight) || 0;
       const delta = Math.max(0, outerH - viewH);
       // Maximized / thin-frame: delta ≈ real tab height. Restored Windows frame: delta ≫ tab.
@@ -595,10 +613,14 @@ export function buildRendererPayload(input: PayloadInput) {
 
     const syncFullWindowMedia = (layer, media, tile) => {
       const viewH = Math.max(Number(window.innerHeight) || 0, 1);
+      const inPageTabs = hasInPageTabBar();
       const tabH = resolveTabChromeHeight(viewH);
       // outerHeight is shared by tab + main targets; keep cover crop identical across the seam.
-      const fullH = Math.max(Number(window.outerHeight) || 0, viewH + (isTabChrome() ? 0 : tabH), 1);
-      const shiftY = isTabChrome() ? 0 : -tabH;
+      // In-page tab bar: single document covers the whole window, so just fill the viewport.
+      const fullH = inPageTabs
+        ? viewH
+        : Math.max(Number(window.outerHeight) || 0, viewH + (isTabChrome() ? 0 : tabH), 1);
+      const shiftY = isTabChrome() || inPageTabs ? 0 : -tabH;
       const heightPx = fullH + "px";
       const topPx = shiftY + "px";
       if (layer.style.position !== "fixed") layer.style.position = "fixed";

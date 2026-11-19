@@ -520,7 +520,8 @@ pub(crate) const EARLY_TRANSPARENCY_SCRIPT: &str = r#"(() => {
   background-image: none !important;
 }
 ` : "";
-      style.textContent = "html,body,.notion-app-inner,.notion-cursor-listener,main.notion-frame,header,.notion-topbar,.notion-sidebar,.notion-sidebar-container,.root,.notion-dark-theme{background:transparent!important;background-color:transparent!important}" +
+      // Notion 7.44+ 标签栏并入主页面：.notion-virtual-tab-container 里的 fixed 拖拽栏是 --c-bacPri 实底。
+      style.textContent = "html,body,.notion-app-inner,.notion-cursor-listener,main.notion-frame,header,.notion-topbar,.notion-sidebar,.notion-sidebar-container,.root,.notion-dark-theme,.notion-virtual-tab-container .notion-desktop-drag-area[style*='--c-bacPri']{background:transparent!important;background-color:transparent!important}" +
         tabChromeCss;
       root.appendChild(style);
       return true;
@@ -852,6 +853,9 @@ mod tests {
         assert!(EARLY_TRANSPARENCY_SCRIPT.contains("box-shadow: none !important"));
         assert!(EARLY_TRANSPARENCY_SCRIPT.contains("[style*="));
         assert!(EARLY_TRANSPARENCY_SCRIPT.contains("background-image: none !important"));
+        assert!(EARLY_TRANSPARENCY_SCRIPT.contains(
+            ".notion-virtual-tab-container .notion-desktop-drag-area[style*='--c-bacPri']"
+        ));
     }
 
     #[test]
